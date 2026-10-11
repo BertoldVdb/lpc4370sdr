@@ -1,0 +1,40 @@
+#include <winver.h>
+#include "../lpc4370sdr.h"
+
+#ifdef GCC_WINDRES
+VS_VERSION_INFO		VERSIONINFO
+#else
+VS_VERSION_INFO		VERSIONINFO	MOVEABLE IMPURE LOADONCALL DISCARDABLE
+#endif
+  FILEVERSION		LPC4370SDR_VER_MAJOR,LPC4370SDR_VER_MINOR,LPC4370SDR_VER_REVISION,0
+  PRODUCTVERSION	LPC4370SDR_VER_MAJOR,LPC4370SDR_VER_MINOR,LPC4370SDR_VER_REVISION,0
+  FILEFLAGSMASK		VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+  FILEFLAGS		1
+#else
+  FILEFLAGS		0
+#endif
+  FILEOS		VOS__WINDOWS32
+  FILETYPE		VFT_DLL
+  FILESUBTYPE		0	// not used
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904E4"
+    //language ID = U.S. English, char set = Windows, Multilingual
+    BEGIN
+      VALUE "FileDescription",	"lpc4370sdr library\0"
+      VALUE "FileVersion",	LPC4370SDR_VERSION "\0"
+      VALUE "InternalName",	"lpc4370sdr.dll\0"
+      VALUE "LegalCopyright",	"(C) 2013-2021 Airspy, (C) 2026 Bertold Van den Bergh\0"
+      VALUE "OriginalFilename",	"lpc4370sdr.dll\0"
+      VALUE "ProductName",	"lpc4370sdr\0"
+      VALUE "ProductVersion",	LPC4370SDR_VERSION "\0"
+      VALUE "Comments",		"For more information visit https://github.com/BertoldVdb/lpc4370sdr-host\0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1252
+  END
+END

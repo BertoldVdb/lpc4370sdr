@@ -1,0 +1,71 @@
+/*
+ * Copyright 2012 Jared Boone
+ * Copyright 2013-2024 Benjamin Vernoux <bvernoux@hydrasdr.com>
+ * Copyright (c) 2026 Bertold Van den Bergh <vandenbergh@bertold.org> (modifications for lpc4370sdr)
+ *
+ * This file is part of lpc4370sdr (derived from HydraSDR, based on the HackRF project).
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; see the file COPYING.  If not, write to
+ * the Free Software Foundation, Inc., 51 Franklin Street,
+ * Boston, MA 02110-1301, USA.
+ */
+#include "usb_endpoint.h"
+#include <usb_request.h>
+#include "usb_device.h"
+#include "m0.h"
+
+usb_endpoint_t usb_endpoint_control_out = {
+  .address = 0x00,
+  .device = &usb_device,
+  .in = &usb_endpoint_control_in,
+  .out = &usb_endpoint_control_out,
+  .setup_complete = usb_setup_complete,
+  .transfer_complete = usb_control_out_complete,
+};
+USB_DEFINE_QUEUE(usb_endpoint_control_out, 4);
+
+usb_endpoint_t usb_endpoint_control_in = {
+  .address = 0x80,
+  .device = &usb_device,
+  .in = &usb_endpoint_control_in,
+  .out = &usb_endpoint_control_out,
+  .setup_complete = 0,
+  .transfer_complete = usb_control_in_complete,
+};
+static USB_DEFINE_QUEUE(usb_endpoint_control_in, 4);
+
+usb_endpoint_t usb_endpoint_bulk_in = {
+  .address = 0x81,
+  .device = &usb_device,
+  .in = &usb_endpoint_bulk_in,
+  .out = 0,
+  .setup_complete = 0,
+  .transfer_complete = usb_bulk_in_transfer_complete,
+};
+static USB_DEFINE_QUEUE(usb_endpoint_bulk_in, LPC4370SDR_STREAM_USB_POOL);
+
+const volatile usb_transfer_descriptor_t* usb_endpoint_bulk_in_td(const uint32_t index)
+{
+  return &usb_endpoint_bulk_in_transfers[index].td;
+}
+
+usb_endpoint_t usb_endpoint_bulk_out = {
+  .address = 0x02,
+  .device = &usb_device,
+  .in = 0,
+  .out = &usb_endpoint_bulk_out,
+  .setup_complete = 0,
+  .transfer_complete = usb_queue_transfer_complete,
+};
+static USB_DEFINE_QUEUE(usb_endpoint_bulk_out, 1);
