@@ -33,6 +33,7 @@ typedef struct {
 	float hbc;
 	int phase; /* position of the next sample in the fs/4 translation's cycle of four */
 	int dc_removal; /* 1 (the default): DC removal before the translation; 0: translation alone */
+	int odd; /* the FIR and delay line's next sample is the Q sample of a pair */
 	int len;
 	int fir_index;
 	int delay_index;
@@ -41,10 +42,16 @@ typedef struct {
 	float *delay_line;
 } iqconverter_float_t;
 
-static iqconverter_float_t *iqconverter_float_create(const float *hb_kernel, int len);
-static void iqconverter_float_free(iqconverter_float_t *cnv);
-static void iqconverter_float_reset(iqconverter_float_t *cnv);
-static void iqconverter_float_process(iqconverter_float_t *cnv, float *samples, int len);
+/* Built into lpc4370sdr.c, static. The libairspy compatibility library builds them in once more
+   with these four exported (IQCONVERTER_API empty), as libairspy exports them. */
+#ifndef IQCONVERTER_API
+#define IQCONVERTER_API static
+#endif
+
+IQCONVERTER_API iqconverter_float_t *iqconverter_float_create(const float *hb_kernel, int len);
+IQCONVERTER_API void iqconverter_float_free(iqconverter_float_t *cnv);
+IQCONVERTER_API void iqconverter_float_reset(iqconverter_float_t *cnv);
+IQCONVERTER_API void iqconverter_float_process(iqconverter_float_t *cnv, float *samples, int len);
 static void iqconverter_float_process_first(iqconverter_float_t *cnv, float *samples, int len);
 static void iqconverter_float_process_second(iqconverter_float_t *cnv, float *samples, int len);
 

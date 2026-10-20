@@ -36,15 +36,22 @@ typedef struct {
 	int32_t old_e;
 	int phase; /* position of the next sample in the fs/4 translation's cycle of four */
 	int dc_removal; /* 1 (the default): high-pass before the translation; 0: translation alone */
+	int odd; /* the FIR and delay line's next sample is the Q sample of a pair */
 	int32_t *fir_kernel;
 	int32_t *fir_queue;
 	int16_t *delay_line;
 } iqconverter_int16_t;
 
-static iqconverter_int16_t *iqconverter_int16_create(const int16_t *hb_kernel, int len);
-static void iqconverter_int16_free(iqconverter_int16_t *cnv);
-static void iqconverter_int16_reset(iqconverter_int16_t *cnv);
-static void iqconverter_int16_process(iqconverter_int16_t *cnv, int16_t *samples, int len);
+/* Built into lpc4370sdr.c, static. The libairspy compatibility library builds them in once more
+   with these four exported (IQCONVERTER_API empty), as libairspy exports them. */
+#ifndef IQCONVERTER_API
+#define IQCONVERTER_API static
+#endif
+
+IQCONVERTER_API iqconverter_int16_t *iqconverter_int16_create(const int16_t *hb_kernel, int len);
+IQCONVERTER_API void iqconverter_int16_free(iqconverter_int16_t *cnv);
+IQCONVERTER_API void iqconverter_int16_reset(iqconverter_int16_t *cnv);
+IQCONVERTER_API void iqconverter_int16_process(iqconverter_int16_t *cnv, int16_t *samples, int len);
 static void iqconverter_int16_process_first(iqconverter_int16_t *cnv, int16_t *samples, int len);
 static void iqconverter_int16_process_second(iqconverter_int16_t *cnv, int16_t *samples, int len);
 

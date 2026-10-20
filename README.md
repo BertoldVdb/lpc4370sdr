@@ -34,11 +34,13 @@ Getting started
 Licenses
 --------
 
-The firmware is licensed under the GNU GPL version 2, see
-[`fw/LICENSE`](fw/LICENSE). The host library is BSD 3-clause with MIT
-components, see [`host/liblpc4370sdr/LICENSE.md`](host/liblpc4370sdr/LICENSE.md).
-The host tools are licensed under the GNU GPL version 2, see
-[`host/lpc4370sdr-tools/LICENSE.md`](host/lpc4370sdr-tools/LICENSE.md).
+The firmware is licensed under the GNU GPL version 2 or (at your option) any
+later version, see [`fw/LICENSE`](fw/LICENSE). The firmware images link
+libopencm3, which is LGPL version 3, so the built images are distributed under
+the GNU GPL version 3. The host library is BSD 3-clause with MIT components, see
+[`host/liblpc4370sdr/LICENSE.md`](host/liblpc4370sdr/LICENSE.md). The host tools
+are licensed under the GNU GPL version 2 or (at your option) any later version,
+see [`host/lpc4370sdr-tools/LICENSE.md`](host/lpc4370sdr-tools/LICENSE.md).
 
 This project derives from the Airspy, HydraSDR and HackRF projects. It is not
 endorsed by Airspy, HydraSDR or Great Scott Gadgets.

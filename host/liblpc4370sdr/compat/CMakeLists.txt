@@ -6,8 +6,12 @@
 # on top of liblpc4370sdr (built in, one file to drop in). Installed out of the way of a real
 # libairspy: point LD_LIBRARY_PATH (or the program's directory on Windows) at it.
 
-add_library(airspy-compat SHARED ${CMAKE_CURRENT_SOURCE_DIR}/airspy_compat.c ${c_sources})
+add_library(airspy-compat SHARED ${CMAKE_CURRENT_SOURCE_DIR}/airspy_compat.c ${CMAKE_CURRENT_SOURCE_DIR}/airspy_iqconverter.c ${c_sources})
 set_target_properties(airspy-compat PROPERTIES OUTPUT_NAME airspy VERSION 1.0.12 SOVERSION 0)
+if(WIN32)
+    # airspy.dll, the name programs for libairspy load (not libairspy.dll)
+    set_target_properties(airspy-compat PROPERTIES PREFIX "")
+endif()
 target_include_directories(airspy-compat PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(airspy-compat ${LIBUSB_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
 # Export the libairspy API only: liblpc4370sdr is built in hidden, so it neither clashes with nor

@@ -36,6 +36,7 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSI
 
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 /* The libairspy API is what this library exports; liblpc4370sdr, built in, stays hidden
    (LPC4370SDR_NO_EXPORT, -fvisibility=hidden) */
@@ -43,6 +44,17 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSI
 #pragma GCC visibility push(default)
 #endif
 #include "airspy.h"
+
+/* Exported by libairspy though airspy.h does not declare them: its gain tables (here a copy of
+   those liblpc4370sdr's airspy_set_linearity_gain() and airspy_set_sensitivity_gain() use) and
+   airspy_set_receiver_mode(). The I/Q converters are in airspy_iqconverter.c. */
+uint8_t airspy_linearity_vga_gains[22] = { 13, 12, 11, 11, 11, 11, 11, 10, 10, 10, 10, 10, 10, 10, 10, 10, 9, 8, 7, 6, 5, 4 };
+uint8_t airspy_linearity_mixer_gains[22] = { 12, 12, 11, 9, 8, 7, 6, 6, 5, 0, 0, 1, 0, 0, 2, 2, 1, 1, 1, 1, 0, 0 };
+uint8_t airspy_linearity_lna_gains[22] = { 14, 14, 14, 13, 12, 10, 9, 9, 8, 9, 8, 6, 5, 3, 1, 0, 0, 0, 0, 0, 0, 0 };
+uint8_t airspy_sensitivity_vga_gains[22] = { 13, 12, 11, 10, 9, 8, 7, 6, 5, 5, 5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4, 4 };
+uint8_t airspy_sensitivity_mixer_gains[22] = { 12, 12, 12, 12, 11, 10, 10, 9, 9, 8, 7, 4, 4, 4, 3, 2, 2, 1, 0, 0, 0, 0 };
+uint8_t airspy_sensitivity_lna_gains[22] = { 14, 14, 14, 14, 14, 14, 14, 14, 14, 13, 12, 12, 9, 9, 8, 7, 6, 5, 3, 2, 1, 0 };
+int ADDCALL airspy_set_receiver_mode(struct airspy_device* device, receiver_mode_t value);
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC visibility pop
 #endif
@@ -62,8 +74,15 @@ struct airspy_device
 	uint32_t block;      /* samples per block delivered */
 	uint32_t fill;       /* samples in buf */
 	uint64_t dropped;    /* samples missing before the block being gathered */
+	uint32_t delay;      /* the I/Q conversion's delay in output samples, rounded up (0 for the real types) */
 	volatile int stop;   /* the application asked to stop: from its callback, or airspy_stop_rx() */
+	struct airspy_device* next; /* in deferred_close */
 };
+
+/* Devices closed from their own sample callback, whose stream had yet to end: closed for good by
+   the next airspy_open*() or airspy_exit() */
+static pthread_mutex_t deferred_close_mp = PTHREAD_MUTEX_INITIALIZER;
+static struct airspy_device* deferred_close;
 
 /* The device whose sample callback this thread is running, if any */
 #if defined(_MSC_VER)
@@ -197,10 +216,14 @@ static int compat_gather(lpc4370sdr_transfer* t)
 		{
 			const lpc4370sdr_gap_t* g = &meta.gaps[i];
 			const uint64_t missing = (g->samples - g->filled) >> shift;
-			const uint32_t at = g->offset >> shift; /* the missing samples lie before the filled ones */
+			/* The missing samples lie before the filled ones. The I/Q conversion's output lags
+			   its input: the first 'delay' output samples from the gap's place on are from before it */
+			uint32_t at = (g->offset >> shift) + d->delay;
 
 			if (missing == 0)
 				continue;
+			if (at > (uint32_t)t->sample_count)
+				at = (uint32_t)t->sample_count;
 			append(d, samples, pos, at);
 			pos = at;
 			gap(d, missing);
@@ -213,6 +236,8 @@ static int compat_gather(lpc4370sdr_transfer* t)
 	else if (t->dropped_samples)
 	{
 		/* No framing: only whole buffers are known to be missing, before this one */
+		pos = d->delay < (uint32_t)t->sample_count ? d->delay : (uint32_t)t->sample_count;
+		append(d, samples, 0, pos);
 		gap(d, t->dropped_samples);
 	}
 
@@ -276,6 +301,43 @@ void ADDCALL airspy_lib_version(airspy_lib_version_t* lib_version)
 	lib_version->revision = AIRSPY_VER_REVISION;
 }
 
+static void free_device(struct airspy_device* device)
+{
+	free(device->buf);
+	free(device);
+}
+
+static void defer_close(struct airspy_device* device)
+{
+	pthread_mutex_lock(&deferred_close_mp);
+	device->next = deferred_close;
+	deferred_close = device;
+	pthread_mutex_unlock(&deferred_close_mp);
+}
+
+static void close_deferred(void)
+{
+	struct airspy_device* d;
+	struct airspy_device* next;
+
+	pthread_mutex_lock(&deferred_close_mp);
+	d = deferred_close;
+	deferred_close = NULL;
+	pthread_mutex_unlock(&deferred_close_mp);
+	for (; d != NULL; d = next)
+	{
+		next = d->next;
+		if (callback_device == d)
+		{
+			/* From its own callback still */
+			defer_close(d);
+			continue;
+		}
+		lpc4370sdr_close(DEV(d));
+		free_device(d);
+	}
+}
+
 int ADDCALL airspy_init(void)
 {
 	return lpc4370sdr_init();
@@ -283,6 +345,7 @@ int ADDCALL airspy_init(void)
 
 int ADDCALL airspy_exit(void)
 {
+	close_deferred();
 	return lpc4370sdr_exit();
 }
 
@@ -294,21 +357,30 @@ int ADDCALL airspy_list_devices(uint64_t* serials, int count)
 int ADDCALL airspy_open_sn(struct airspy_device** device, uint64_t serial_number)
 {
 	struct lpc4370sdr_device* dev = NULL;
-	int result = lpc4370sdr_open_sn(&dev, serial_number);
+	int result;
+
+	close_deferred();
+	result = lpc4370sdr_open_sn(&dev, serial_number);
 	return wrap(device, dev, result);
 }
 
 int ADDCALL airspy_open_fd(struct airspy_device** device, int fd)
 {
 	struct lpc4370sdr_device* dev = NULL;
-	int result = lpc4370sdr_open_fd(&dev, fd);
+	int result;
+
+	close_deferred();
+	result = lpc4370sdr_open_fd(&dev, fd);
 	return wrap(device, dev, result);
 }
 
 int ADDCALL airspy_open(struct airspy_device** device)
 {
 	struct lpc4370sdr_device* dev = NULL;
-	int result = lpc4370sdr_open(&dev);
+	int result;
+
+	close_deferred();
+	result = lpc4370sdr_open(&dev);
 	return wrap(device, dev, result);
 }
 
@@ -317,11 +389,13 @@ int ADDCALL airspy_close(struct airspy_device* device)
 	int result = AIRSPY_SUCCESS;
 	if (device != NULL)
 	{
-		/* Not from the sample callback: the stream stops, the device stays */
+		/* From the sample callback the stream stops, and the device is closed once the stream
+		   has ended: by the next airspy_open*() or airspy_exit() */
 		if (callback_device == device)
 		{
 			device->stop = 1;
-			return AIRSPY_ERROR_BUSY;
+			defer_close(device);
+			return AIRSPY_SUCCESS;
 		}
 		result = lpc4370sdr_close(DEV(device));
 		if (result == LPC4370SDR_ERROR_BUSY)
@@ -329,8 +403,7 @@ int ADDCALL airspy_close(struct airspy_device* device)
 			device->stop = 1;
 			return result;
 		}
-		free(device->buf);
-		free(device);
+		free_device(device);
 	}
 	return result;
 }
@@ -377,6 +450,9 @@ int ADDCALL airspy_start_rx(struct airspy_device* device, airspy_sample_block_cb
 	else
 	{
 		size_t bytes;
+		double delay = 0;
+		lpc4370sdr_get_conversion_delay(DEV(d), &delay, NULL);
+		d->delay = (uint32_t)(delay + 0.5);
 		d->block = block_real_samples(d->packing) >> (is_iq(d->sample_type) ? 1 : 0);
 		bytes = (size_t)d->block * d->sample_bytes;
 		if (bytes > d->buf_bytes)
@@ -396,6 +472,21 @@ int ADDCALL airspy_stop_rx(struct airspy_device* device)
 {
 	device->stop = 1; /* no block after this, also when called from the callback */
 	return lpc4370sdr_stop_rx(DEV(device));
+}
+
+/* libairspy's own start and stop of the device's stream. Here the stream is liblpc4370sdr's:
+   RECEIVER_MODE_OFF stops it like airspy_stop_rx(), RECEIVER_MODE_RX only goes with it */
+int ADDCALL airspy_set_receiver_mode(struct airspy_device* device, receiver_mode_t value)
+{
+	switch (value)
+	{
+	case RECEIVER_MODE_OFF:
+		return airspy_stop_rx(device);
+	case RECEIVER_MODE_RX:
+		return lpc4370sdr_is_streaming(DEV(device)) == LPC4370SDR_TRUE ? AIRSPY_SUCCESS : AIRSPY_ERROR_UNSUPPORTED;
+	default:
+		return AIRSPY_ERROR_INVALID_PARAM;
+	}
 }
 
 int ADDCALL airspy_is_streaming(struct airspy_device* device)
@@ -491,13 +582,27 @@ int ADDCALL airspy_board_partid_serialno_read(struct airspy_device* device, airs
 	return lpc4370sdr_board_partid_serialno_read(DEV(device), (lpc4370sdr_read_partid_serialno_t*)read_partid_serialno);
 }
 
-/* Not while streaming: the blocks being gathered have the sample size of the stream's type
-   (liblpc4370sdr refuses the change with AIRSPY_ERROR_BUSY) */
+/* libairspy changes the sample type of a stream from its next buffer on. liblpc4370sdr's stream
+   and the blocks gathered here are sized for their type, so the stream restarts with the new one:
+   the samples of the restart are missing, uncounted. Not from the sample callback, which cannot
+   wait for its stream to end: there liblpc4370sdr refuses the change with AIRSPY_ERROR_BUSY. */
 int ADDCALL airspy_set_sample_type(struct airspy_device* device, enum airspy_sample_type sample_type)
 {
-	int result = lpc4370sdr_set_sample_type(DEV(device), (enum lpc4370sdr_sample_type)sample_type);
+	const int restart = sample_type != device->sample_type && callback_device != device &&
+		lpc4370sdr_is_streaming(DEV(device)) == LPC4370SDR_TRUE;
+	int result;
+
+	if (restart)
+		airspy_stop_rx(device);
+	result = lpc4370sdr_set_sample_type(DEV(device), (enum lpc4370sdr_sample_type)sample_type);
 	if (result == LPC4370SDR_SUCCESS)
 		device->sample_type = sample_type;
+	if (restart)
+	{
+		const int started = airspy_start_rx(device, device->callback, device->ctx);
+		if (result == LPC4370SDR_SUCCESS)
+			result = started;
+	}
 	return result;
 }
 
@@ -546,9 +651,13 @@ int ADDCALL airspy_set_rf_bias(struct airspy_device* dev, uint8_t value)
 	return lpc4370sdr_set_rf_bias(DEV(dev), value);
 }
 
+/* libairspy: any value but 0 packs (liblpc4370sdr's 2 and 3 are other formats) */
 int ADDCALL airspy_set_packing(struct airspy_device* device, uint8_t value)
 {
-	int result = lpc4370sdr_set_packing(DEV(device), value);
+	int result;
+
+	value = value ? 1 : 0;
+	result = lpc4370sdr_set_packing(DEV(device), value);
 	if (result == LPC4370SDR_SUCCESS)
 		device->packing = value;
 	return result;

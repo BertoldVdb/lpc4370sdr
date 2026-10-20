@@ -66,16 +66,41 @@ static _inline void store4_int16(int32_t *p, v4si v) { memcpy(p, &v, sizeof(v));
 static _inline v4si load4_int16(const int32_t *p) { v4si v; memcpy(&v, p, sizeof(v)); return v; }
 #endif
 
-static iqconverter_int16_t *iqconverter_int16_create(const int16_t *hb_kernel, int len)
+IQCONVERTER_API iqconverter_int16_t *iqconverter_int16_create(const int16_t *hb_kernel, int len)
 {
 	int i;
+	int32_t sum;
 	size_t buffer_size;
 	iqconverter_int16_t *cnv;
 
-	/* A half-band kernel has an odd length, its centre tap in the middle */
-	if (hb_kernel == NULL || len < 3 || (len & 1) == 0)
+	/* A half-band kernel of 4k + 3 taps: the FIR takes those at the even indices, the delay line
+	   the centre tap, at the odd index in the middle, and the taps at the other odd indices (an
+	   even distance from the centre) are zero. Other kernels do not fit the structure: a 4k + 1
+	   one, split the same way, rejected the image by 16 dB only. */
+	if (hb_kernel == NULL || len < 3 || (len & 3) != 3)
 	{
 		return NULL;
+	}
+	for (i = 1; i < len; i += 2)
+	{
+		if (i != len / 2 && hb_kernel[i] != 0)
+		{
+			return NULL;
+		}
+	}
+	/* The centre tap is 0.5, which the fs/4 translation applies as a shift; and the FIR's int32
+	   accumulator holds up to the sum of its taps' magnitudes times 32768 */
+	if (hb_kernel[len / 2] != 16384)
+	{
+		return NULL;
+	}
+	for (i = 0, sum = 0; i < len; i += 2)
+	{
+		sum += abs(hb_kernel[i]);
+		if (sum > 65535)
+		{
+			return NULL;
+		}
 	}
 
 	cnv = (iqconverter_int16_t *) _aligned_malloc(sizeof(iqconverter_int16_t), DEFAULT_ALIGNMENT);
@@ -108,7 +133,7 @@ static iqconverter_int16_t *iqconverter_int16_create(const int16_t *hb_kernel, i
 	return cnv;
 }
 
-static void iqconverter_int16_free(iqconverter_int16_t *cnv)
+IQCONVERTER_API void iqconverter_int16_free(iqconverter_int16_t *cnv)
 {
 	if (cnv == NULL)
 	{
@@ -123,7 +148,7 @@ static void iqconverter_int16_free(iqconverter_int16_t *cnv)
 	_aligned_free(cnv);
 }
 
-static void iqconverter_int16_reset(iqconverter_int16_t *cnv)
+IQCONVERTER_API void iqconverter_int16_reset(iqconverter_int16_t *cnv)
 {
 	cnv->fir_index = 0;
 	cnv->delay_index = 0;
@@ -131,6 +156,7 @@ static void iqconverter_int16_reset(iqconverter_int16_t *cnv)
 	cnv->old_y = 0;
 	cnv->old_e = 0;
 	cnv->phase = 0;
+	cnv->odd = 0;
 	memset(cnv->delay_line, 0, (cnv->len / 2 + FIR_BLOCK) * sizeof(int16_t));
 	memset(cnv->fir_queue, 0, (cnv->len - 1 + FIR_BLOCK) * sizeof(int32_t));
 }
@@ -141,7 +167,8 @@ static void iqconverter_int16_reset(iqconverter_int16_t *cnv)
  * filtered, delay_line the last len / 2 Q inputs followed by the block. Outputs are computed
  * FIR_GROUP at a time with every tap applied to the whole group, so the accumulators stay in
  * (vector) registers. Integer sums do not depend on their order: the results are the same as
- * one multiply-add chain per output.
+ * one multiply-add chain per output. A block of odd length ends with the I sample of a pair:
+ * cnv->odd says the next block starts with its Q sample.
  */
 /* Every int16 the converter writes saturates. The high-pass after a full-scale input, the fs/4
    translation's negation of -32768 and the half-band filter's overshoot all exceed int16, and a
@@ -160,9 +187,18 @@ static void fir_delay_interleaved_int16(iqconverter_int16_t *cnv, int16_t *sampl
 	const int32_t *kernel = cnv->fir_kernel;
 	int32_t *x = cnv->fir_queue;
 	int16_t *q = cnv->delay_line;
-	int n = len / 2;
-	int done, i, k;
+	int n, done, i, k;
 
+	if (cnv->odd && len > 0)
+	{
+		q[half] = samples[0];
+		samples[0] = q[0];
+		memmove(q, q + 1, half * sizeof(int16_t));
+		samples++;
+		len--;
+		cnv->odd = 0;
+	}
+	n = len / 2;
 	for (done = 0; done < n; done += FIR_BLOCK)
 	{
 		int m = (n - done < FIR_BLOCK) ? n - done : FIR_BLOCK;
@@ -246,6 +282,18 @@ static void fir_delay_interleaved_int16(iqconverter_int16_t *cnv, int16_t *sampl
 		}
 		memmove(x, x + m, (taps - 1) * sizeof(int32_t));
 		memmove(q, q + m, half * sizeof(int16_t));
+	}
+	if (len & 1)
+	{
+		int32_t acc = 0;
+		x[taps - 1] = samples[len - 1];
+		for (k = 0; k < taps; k++)
+		{
+			acc += kernel[k] * x[taps - 1 - k];
+		}
+		samples[len - 1] = sat16(acc >> 15);
+		memmove(x, x + 1, (taps - 1) * sizeof(int32_t));
+		cnv->odd = 1;
 	}
 }
 
@@ -372,18 +420,18 @@ static void remove_dc_translate_fs_4_int16(iqconverter_int16_t *cnv, int16_t *sa
 }
 
 /* The two halves of iqconverter_int16_process(), for running them on two threads: they use
-   separate parts of the state */
-static void iqconverter_int16_process_first(iqconverter_int16_t *cnv, int16_t *samples, int len)
+   separate parts of the state (inline: the libairspy compatibility library does not use them) */
+static _inline void iqconverter_int16_process_first(iqconverter_int16_t *cnv, int16_t *samples, int len)
 {
 	remove_dc_translate_fs_4_int16(cnv, samples, len);
 }
 
-static void iqconverter_int16_process_second(iqconverter_int16_t *cnv, int16_t *samples, int len)
+static _inline void iqconverter_int16_process_second(iqconverter_int16_t *cnv, int16_t *samples, int len)
 {
 	fir_delay_interleaved_int16(cnv, samples, len);
 }
 
-static void iqconverter_int16_process(iqconverter_int16_t *cnv, int16_t *samples, int len)
+IQCONVERTER_API void iqconverter_int16_process(iqconverter_int16_t *cnv, int16_t *samples, int len)
 {
 	remove_dc_translate_fs_4_int16(cnv, samples, len);
 	fir_delay_interleaved_int16(cnv, samples, len);

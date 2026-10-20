@@ -25,9 +25,15 @@ THE SOFTWARE.
 
 #include <stdint.h>
 
+/* Built into lpc4370sdr.c, static; the libairspy compatibility library exports them (IQCONVERTER_API
+   empty), as libairspy does */
+#ifndef IQCONVERTER_API
+#define IQCONVERTER_API static
+#endif
+
 #define HB_KERNEL_FLOAT_LEN 47
 
-static const float HB_KERNEL_FLOAT[HB_KERNEL_FLOAT_LEN] =
+IQCONVERTER_API const float HB_KERNEL_FLOAT[HB_KERNEL_FLOAT_LEN] =
 {
 	-0.000998606272947510,
 	 0.000000000000000000,
@@ -80,7 +86,7 @@ static const float HB_KERNEL_FLOAT[HB_KERNEL_FLOAT_LEN] =
 
 #define HB_KERNEL_INT16_LEN 47
 
-static const int16_t HB_KERNEL_INT16[HB_KERNEL_INT16_LEN] =
+IQCONVERTER_API const int16_t HB_KERNEL_INT16[HB_KERNEL_INT16_LEN] =
 {
 	-33,
 	 0,
