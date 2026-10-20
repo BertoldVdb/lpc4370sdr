@@ -22,7 +22,7 @@
 
 # Based heavily upon the libftdi cmake setup.
 
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.10)
 project(liblpc4370sdr C)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/lpc4370sdr.h LPC4370SDR_H_CONTENTS)
 
@@ -40,7 +40,7 @@ set(LPC4370SDR_VER_MINOR ${LPC4370SDR_VER_MI})
 set(LPC4370SDR_VER_REVISION ${LPC4370SDR_VER_RE})
 
 set(PACKAGE liblpc4370sdr)
-set(VERSION_STRING ${LPC4370SDR_VER_MAJOR}.${LPC4370SDR_VER_MINOR})
+set(VERSION_STRING ${LPC4370SDR_VER_MAJOR}.${LPC4370SDR_VER_MINOR}.${LPC4370SDR_VER_REVISION})
 set(VERSION ${VERSION_STRING})
 set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/../cmake/modules)
 # Standalone builds pick the C standard here (the top-level project sets it for both)
@@ -99,6 +99,12 @@ endif()
 FOREACH(inc ${LIBUSB_INCLUDE_DIR})
     LIST(APPEND LPC4370SDR_PC_CFLAGS "-I${inc}")
 ENDFOREACH(inc)
+# Static linking: libusb-1.0 comes in through Requires.private, the thread library here
+if(CMAKE_THREAD_LIBS_INIT)
+    LIST(APPEND LPC4370SDR_PC_LIBS ${CMAKE_THREAD_LIBS_INIT})
+elseif(UNIX)
+    LIST(APPEND LPC4370SDR_PC_LIBS "-pthread")
+endif()
 
 # use space-separation format for the pc file
 STRING(REPLACE ";" " " LPC4370SDR_PC_CFLAGS "${LPC4370SDR_PC_CFLAGS}")
@@ -107,7 +113,6 @@ STRING(REPLACE ";" " " LPC4370SDR_PC_LIBS "${LPC4370SDR_PC_LIBS}")
 # unset these vars to avoid hard-coded paths to cross environment
 IF(CMAKE_CROSSCOMPILING)
     UNSET(LPC4370SDR_PC_CFLAGS)
-    UNSET(LPC4370SDR_PC_LIBS)
 ENDIF(CMAKE_CROSSCOMPILING)
 
 set(prefix ${CMAKE_INSTALL_PREFIX})

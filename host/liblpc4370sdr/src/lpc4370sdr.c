@@ -69,7 +69,6 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSI
 #define SERIAL_NUMBER_UNUSED (0ULL)
 #define FILE_DESCRIPTOR_UNUSED (-1)
 
-#define USB_PRODUCT_ID (2)
 #define STR_DESCRIPTOR_SIZE (250)
 
 #define MIN_SAMPLERATE_BY_VALUE (1000000)
@@ -111,8 +110,8 @@ typedef struct lpc4370sdr_device
 	libusb_device_handle* usb_device;
 	struct libusb_transfer** transfers;
 	lpc4370sdr_sample_block_cb_fn callback;
-	volatile bool streaming;
-	volatile bool stop_requested;
+	long streaming; /* flags read and written on several threads: get_flag(), set_flag() */
+	long stop_requested;
 	pthread_t transfer_thread;
 	pthread_t consumer_thread;
 	bool transfer_thread_running;
@@ -154,7 +153,7 @@ typedef struct lpc4370sdr_device
 	bool dc_removal; /* the I/Q converters' DC removal (lpc4370sdr_set_dc_removal) */
 	bool framing_requested;
 	bool framing_active;
-	volatile bool gap_fill; /* lpc4370sdr_set_gap_fill() */
+	long gap_fill; /* lpc4370sdr_set_gap_fill(), a flag like streaming */
 	uint32_t fill_max; /* samples gap fill may add to a block: the buffers have room for them */
 	uint32_t sof_count_seen; /* last SOF tag count deframed: a change means a new tag */
 	uint32_t pps_count_seen; /* last PPS count deframed: a change means a new edge */
@@ -281,6 +280,31 @@ static void in_flight_add(lpc4370sdr_device_t* device, long n)
 #else
 	__atomic_fetch_add(&device->transfers_in_flight, n, __ATOMIC_SEQ_CST);
 #endif
+}
+
+/* A flag shared between threads (streaming, stop_requested, gap_fill) */
+static bool get_flag(long* flag)
+{
+#if defined(_MSC_VER)
+	return InterlockedCompareExchange((volatile LONG*)flag, 0, 0) != 0;
+#else
+	return __atomic_load_n(flag, __ATOMIC_SEQ_CST) != 0;
+#endif
+}
+
+static void set_flag(long* flag, bool value)
+{
+#if defined(_MSC_VER)
+	InterlockedExchange((volatile LONG*)flag, value ? 1 : 0);
+#else
+	__atomic_store_n(flag, value ? 1 : 0, __ATOMIC_SEQ_CST);
+#endif
+}
+
+/* The stream runs and nobody asked it to stop */
+static bool stream_running(lpc4370sdr_device_t* device)
+{
+	return get_flag(&device->streaming) && !get_flag(&device->stop_requested);
 }
 
 static void* alloc_usb_buffer(lpc4370sdr_device_t* device)
@@ -992,10 +1016,10 @@ static enum deframe_result deframe_header(lpc4370sdr_device_t* device, deframe_c
 	lost = device->lost_ext;
 	if (device->chunk_index_valid)
 	{
-		uint32_t gap = chunk_index - device->last_chunk_index - 1;
+		uint32_t missing = chunk_index - device->last_chunk_index - 1;
 		uint32_t counted = lost - device->last_lost_chunks;
-		if ((int32_t)gap > 0 && gap > counted)
-			m->unaccounted_chunks += gap - counted;
+		if ((int32_t)missing > 0 && missing > counted)
+			m->unaccounted_chunks += missing - counted;
 	}
 	device->last_chunk_index = chunk_index;
 	device->last_lost_chunks = lost;
@@ -1014,13 +1038,21 @@ static enum deframe_result deframe_header(lpc4370sdr_device_t* device, deframe_c
 		const uint64_t back = (uint64_t)overrun_back * *samples;
 		m->overrun_sample_index = back <= *index ? *index - back : 0;
 	}
-	m->pps_sample_index = widen_index(*index, hdr32(chunk, HDR(pps_sample_index_lo)));
-	m->pps_fraction = (uint32_t)hdr16(chunk, HDR(pps_fraction)) << 16;
+	/* The last edge (SOF) stays in the headers when the input stops: taken when its count changes,
+	   while its low word still widens from this chunk's index */
 	m->pps_count = device->pps_ext;
-	m->sof_sample_index = widen_index(*index, hdr32(chunk, HDR(sof_sample_index_lo)));
-	m->sof_fraction = (uint32_t)hdr16(chunk, HDR(sof_fraction)) << 16;
-	m->sof_frame = device->sof_frame_ext;
+	if (m->pps_count != device->pps_count_seen)
+	{
+		m->pps_sample_index = widen_index(*index, hdr32(chunk, HDR(pps_sample_index_lo)));
+		m->pps_fraction = (uint32_t)hdr16(chunk, HDR(pps_fraction)) << 16;
+	}
 	m->sof_count = device->sof_count_ext;
+	if (m->sof_count != device->sof_count_seen)
+	{
+		m->sof_sample_index = widen_index(*index, hdr32(chunk, HDR(sof_sample_index_lo)));
+		m->sof_fraction = (uint32_t)hdr16(chunk, HDR(sof_fraction)) << 16;
+		m->sof_frame = device->sof_frame_ext;
+	}
 	if (m->sof_count != 0 && m->sof_count != device->sof_count_seen && m->sof_tags_len < LPC4370SDR_METADATA_SOF_MAX)
 	{
 		lpc4370sdr_sof_tag_t* tag = &m->sof_tags[m->sof_tags_len++];
@@ -1034,12 +1066,13 @@ static enum deframe_result deframe_header(lpc4370sdr_device_t* device, deframe_c
 		uint32_t n = chunk[HDR(uart_len)];
 		if (n > LPC4370SDR_FRAME_UART_BYTES)
 			n = LPC4370SDR_FRAME_UART_BYTES;
-		if (m->uart_len + n <= LPC4370SDR_METADATA_UART_MAX)
-		{
-			memcpy(&m->uart_data[m->uart_len], chunk + HDR(uart_data), n);
-			m->uart_len += n;
-			device->uart_total += n;
-		}
+		/* Bytes past the end of uart_data are counted and keep their numbers: the next block's
+		   uart_offset skips them */
+		const uint32_t fit = (m->uart_len + n <= LPC4370SDR_METADATA_UART_MAX) ? n : LPC4370SDR_METADATA_UART_MAX - m->uart_len;
+		memcpy(&m->uart_data[m->uart_len], chunk + HDR(uart_data), fit);
+		m->uart_len += fit;
+		m->uart_dropped += n - fit;
+		device->uart_total += n;
 		/* A new edge: its place among the bytes, from the end of this chunk's (bytes lost with
 		   a chunk before it shift only those older ones) */
 		if (m->pps_count != device->pps_count_seen)
@@ -1108,7 +1141,7 @@ static uint32_t deframe_gap(lpc4370sdr_device_t* device, deframe_ctx_t* ctx, uin
 	lpc4370sdr_transfer_metadata_t* m = &device->meta;
 	uint32_t fill = 0, i;
 
-	if (device->gap_fill && !ctx->keep_raw)
+	if (get_flag(&device->gap_fill) && !ctx->keep_raw)
 	{
 		fill = (gap < ctx->fill_room) ? (uint32_t)gap : ctx->fill_room & ~3u;
 		if (fill < gap)
@@ -1420,11 +1453,11 @@ static bool dsp_queue_block(lpc4370sdr_device_t* device, enum lpc4370sdr_sample_
 	dsp_slot_t* slot;
 
 	pthread_mutex_lock(&device->dsp_mp);
-	while (device->dsp_count == DSP_SLOTS && device->streaming && !device->stop_requested)
+	while (device->dsp_count == DSP_SLOTS && stream_running(device))
 	{
 		pthread_cond_wait(&device->dsp_cv, &device->dsp_mp);
 	}
-	if (!device->streaming || device->stop_requested)
+	if (!stream_running(device))
 	{
 		pthread_mutex_unlock(&device->dsp_mp);
 		return false;
@@ -1519,7 +1552,7 @@ static void* dsp_threadproc(void *arg)
 	bool iq;
 
 	pthread_mutex_lock(&device->dsp_mp);
-	while (device->streaming && !device->stop_requested)
+	while (stream_running(device))
 	{
 		dsp_slot_t* slot;
 		int sample_count;
@@ -1556,7 +1589,7 @@ static void* dsp_threadproc(void *arg)
 
 		if (run_callback(device, &transfer) != 0)
 		{
-			device->streaming = false;
+			set_flag(&device->streaming, false);
 		}
 
 		pthread_mutex_lock(&device->dsp_mp);
@@ -1564,7 +1597,7 @@ static void* dsp_threadproc(void *arg)
 		device->dsp_count--;
 		pthread_cond_broadcast(&device->dsp_cv);
 	}
-	device->streaming = false;
+	set_flag(&device->streaming, false);
 	pthread_cond_broadcast(&device->dsp_cv);
 	pthread_mutex_unlock(&device->dsp_mp);
 
@@ -1589,13 +1622,13 @@ static void* consumer_threadproc(void *arg)
 
 	pthread_mutex_lock(&device->consumer_mp);
 
-	while (device->streaming && !device->stop_requested)
+	while (stream_running(device))
 	{
-		while (device->received_buffer_count == 0 && device->streaming && !device->stop_requested)
+		while (device->received_buffer_count == 0 && stream_running(device))
 		{
 			pthread_cond_wait(&device->consumer_cv, &device->consumer_mp);
 		}
-		if (!device->streaming || device->stop_requested)
+		if (!stream_running(device))
 		{
 			break;
 		}
@@ -1717,14 +1750,14 @@ static void* consumer_threadproc(void *arg)
 
 		if (run_callback(device, &transfer) != 0)
 		{
-			device->streaming = false;
+			set_flag(&device->streaming, false);
 		}
 
 		pthread_mutex_lock(&device->consumer_mp);
 		device->received_buffer_count--;
 	}
 
-	device->streaming = false;
+	set_flag(&device->streaming, false);
 
 	pthread_mutex_unlock(&device->consumer_mp);
 
@@ -1741,7 +1774,7 @@ static void lpc4370sdr_libusb_transfer_callback(struct libusb_transfer* usb_tran
 	uint16_t *temp;
 	lpc4370sdr_device_t* device = (lpc4370sdr_device_t*)usb_transfer->user_data;
 
-	if (!device->streaming || device->stop_requested)
+	if (!stream_running(device))
 	{
 		in_flight_add(device, -1);
 		return;
@@ -1775,13 +1808,13 @@ static void lpc4370sdr_libusb_transfer_callback(struct libusb_transfer* usb_tran
 		if (libusb_submit_transfer(usb_transfer) != 0)
 		{
 			in_flight_add(device, -1);
-			device->streaming = false;
+			set_flag(&device->streaming, false);
 		}
 	}
 	else
 	{
 		in_flight_add(device, -1);
-		device->streaming = false;
+		set_flag(&device->streaming, false);
 	}
 }
 
@@ -1797,17 +1830,17 @@ static void* transfer_threadproc(void* arg)
 
 #endif
 
-	while (device->streaming && !device->stop_requested)
+	while (stream_running(device))
 	{
 		error = libusb_handle_events_timeout_completed(device->usb_context, &timeout, NULL);
 		if (error < 0)
 		{
 			if (error != LIBUSB_ERROR_INTERRUPTED)
-				device->streaming = false;
+				set_flag(&device->streaming, false);
 		}
 	}
 	
-	device->streaming = false;
+	set_flag(&device->streaming, false);
 
 	return NULL;
 }
@@ -1833,7 +1866,7 @@ static void join_deferred(lpc4370sdr_device_t* device)
 static bool io_busy(lpc4370sdr_device_t* device)
 {
 	join_deferred(device);
-	return device->streaming || device->stop_requested || io_threads_running(device) || in_flight(device) > 0 ||
+	return get_flag(&device->streaming) || get_flag(&device->stop_requested) || io_threads_running(device) || in_flight(device) > 0 ||
 		device->deferred_join_pending;
 }
 
@@ -1895,9 +1928,9 @@ static void join_io_thread(lpc4370sdr_device_t* device, pthread_t thread, bool* 
 
 static int kill_io_threads(lpc4370sdr_device_t* device)
 {
-	if (device->stop_requested)
+	if (get_flag(&device->stop_requested))
 	{
-		device->streaming = false;
+		set_flag(&device->streaming, false);
 		cancel_transfers(device);
 
 		/* Wake every thread before joining any: a consumer waiting for a free DSP slot only
@@ -1914,7 +1947,7 @@ static int kill_io_threads(lpc4370sdr_device_t* device)
 		join_io_thread(device, device->dsp_thread, &device->dsp_thread_running);
 
 		reap_transfers(device);
-		device->stop_requested = false;
+		set_flag(&device->stop_requested, false);
 	}
 	join_deferred(device);
 
@@ -1938,13 +1971,13 @@ static int create_io_threads(lpc4370sdr_device_t* device, lpc4370sdr_sample_bloc
 	device->dsp_head = 0;
 	device->dsp_tail = 0;
 	device->dsp_count = 0;
-	device->dsp_active = device->dsp_thread_enabled;
-	device->streaming = true;
+	device->dsp_active = device->dsp_thread_enabled && SAMPLE_TYPE_IS_IQ(device->sample_type);
+	set_flag(&device->streaming, true);
 
 	result = prepare_transfers(device, LIBUSB_ENDPOINT_IN | 1, (libusb_transfer_cb_fn)lpc4370sdr_libusb_transfer_callback);
 	if (result != LPC4370SDR_SUCCESS)
 	{
-		device->streaming = false;
+		set_flag(&device->streaming, false);
 		reap_transfers(device);
 		return result;
 	}
@@ -1978,10 +2011,19 @@ static int create_io_threads(lpc4370sdr_device_t* device, lpc4370sdr_sample_bloc
 
 	if (result != LPC4370SDR_SUCCESS)
 	{
-		device->stop_requested = true;
+		set_flag(&device->stop_requested, true);
 		kill_io_threads(device);
 	}
 	return result;
+}
+
+static void destroy_sync(lpc4370sdr_device_t* device)
+{
+	pthread_cond_destroy(&device->consumer_cv);
+	pthread_mutex_destroy(&device->consumer_mp);
+	pthread_cond_destroy(&device->dsp_cv);
+	pthread_mutex_destroy(&device->dsp_mp);
+	pthread_mutex_destroy(&device->state_mp);
 }
 
 static void lpc4370sdr_open_exit(lpc4370sdr_device_t* device)
@@ -2012,6 +2054,7 @@ static void lpc4370sdr_open_device(lpc4370sdr_device_t* device,
 	int serial_descriptor_index;
 	struct libusb_device_descriptor device_descriptor;
 	unsigned char serial_number[SERIAL_STRING_MAX + 1];
+	bool busy = false; /* a matching device is claimed by someone else */
 
 	libusb_dev_handle = &device->usb_device;
 	*libusb_dev_handle = NULL;
@@ -2060,15 +2103,13 @@ static void lpc4370sdr_open_device(lpc4370sdr_device_t* device,
 							}
 #endif
 							result = libusb_set_configuration(dev_handle, 1);
-							if (result != 0)
+							if (result == 0)
 							{
-								libusb_close(dev_handle);
-								*libusb_dev_handle = NULL;
-								continue;
+								result = libusb_claim_interface(dev_handle, 0);
 							}
-							result = libusb_claim_interface(dev_handle, 0);
 							if (result != 0)
 							{
+								busy = busy || result == LIBUSB_ERROR_BUSY;
 								libusb_close(dev_handle);
 								*libusb_dev_handle = NULL;
 								continue;
@@ -2105,15 +2146,13 @@ static void lpc4370sdr_open_device(lpc4370sdr_device_t* device,
 					}
 #endif
 					result = libusb_set_configuration(dev_handle, 1);
-					if (result != 0)
+					if (result == 0)
 					{
-						libusb_close(dev_handle);
-						*libusb_dev_handle = NULL;
-						continue;
+						result = libusb_claim_interface(dev_handle, 0);
 					}
-					result = libusb_claim_interface(dev_handle, 0);
 					if (result != 0)
 					{
+						busy = busy || result == LIBUSB_ERROR_BUSY;
 						libusb_close(dev_handle);
 						*libusb_dev_handle = NULL;
 						continue;
@@ -2128,7 +2167,7 @@ static void lpc4370sdr_open_device(lpc4370sdr_device_t* device,
 	dev_handle = device->usb_device;
 	if (dev_handle == NULL)
 	{
-		*ret = LPC4370SDR_ERROR_NOT_FOUND;
+		*ret = busy ? LPC4370SDR_ERROR_BUSY : LPC4370SDR_ERROR_NOT_FOUND;
 		return;
 	}
 
@@ -2225,6 +2264,10 @@ static int lpc4370sdr_open_init(lpc4370sdr_device_t** device, uint64_t serial_nu
 	int libusb_error;
 	int result;
 
+	if (device == NULL)
+	{
+		return LPC4370SDR_ERROR_INVALID_PARAM;
+	}
 	*device = NULL;
 
 	lib_device = (lpc4370sdr_device_t*)calloc(1, sizeof(lpc4370sdr_device_t));
@@ -2247,6 +2290,7 @@ static int lpc4370sdr_open_init(lpc4370sdr_device_t** device, uint64_t serial_nu
 	libusb_error = libusb_init(&lib_device->usb_context);
 	if (libusb_error != 0)
 	{
+		destroy_sync(lib_device);
 		free(lib_device);
 		return LPC4370SDR_ERROR_LIBUSB;
 	}
@@ -2265,6 +2309,7 @@ static int lpc4370sdr_open_init(lpc4370sdr_device_t** device, uint64_t serial_nu
 	if (lib_device->usb_device == NULL)
 	{
 		libusb_exit(lib_device->usb_context);
+		destroy_sync(lib_device);
 		free(lib_device);
 		return result;
 	}
@@ -2277,7 +2322,7 @@ static int lpc4370sdr_open_init(lpc4370sdr_device_t** device, uint64_t serial_nu
 	lib_device->packing_mode = 0;
 	lib_device->dev_mem_buffers = false;
 	lib_device->framing_requested = true;
-	lib_device->gap_fill = false;
+	set_flag(&lib_device->gap_fill, false);
 	{
 		const char* env_ppb = getenv("LPC4370SDR_CALIBRATION_PPB");
 		if (env_ppb != NULL && *env_ppb != 0)
@@ -2318,35 +2363,43 @@ static int lpc4370sdr_open_init(lpc4370sdr_device_t** device, uint64_t serial_nu
 	lib_device->uart_total = 0;
 	lib_device->sof_divider = 0;
 	memset(&lib_device->meta, 0, sizeof(lib_device->meta));
-	lib_device->streaming = false;
-	lib_device->stop_requested = false;
+	set_flag(&lib_device->streaming, false);
+	set_flag(&lib_device->stop_requested, false);
 	lib_device->sample_type = LPC4370SDR_SAMPLE_FLOAT32_IQ;
 
 	lib_device->supported_samplerates = NULL;
 	result = lpc4370sdr_read_samplerates_from_fw(lib_device, &lib_device->supported_samplerate_count, 0);
-	if (result == LPC4370SDR_SUCCESS && lib_device->supported_samplerate_count > 0 && lib_device->supported_samplerate_count <= SAMPLERATES_MAX)
+	if (result == LPC4370SDR_SUCCESS)
 	{
-		lib_device->supported_samplerates = (uint32_t *) malloc(lib_device->supported_samplerate_count * sizeof(uint32_t));
-		if (lib_device->supported_samplerates == NULL ||
-			lpc4370sdr_read_samplerates_from_fw(lib_device, lib_device->supported_samplerates, lib_device->supported_samplerate_count) != LPC4370SDR_SUCCESS)
+		result = LPC4370SDR_ERROR_OTHER;
+		if (lib_device->supported_samplerate_count > 0 && lib_device->supported_samplerate_count <= SAMPLERATES_MAX)
 		{
-			free(lib_device->supported_samplerates);
-			lib_device->supported_samplerates = NULL;
+			lib_device->supported_samplerates = (uint32_t *) malloc(lib_device->supported_samplerate_count * sizeof(uint32_t));
+			result = (lib_device->supported_samplerates == NULL) ? LPC4370SDR_ERROR_NO_MEM :
+				lpc4370sdr_read_samplerates_from_fw(lib_device, lib_device->supported_samplerates, lib_device->supported_samplerate_count);
 		}
 	}
-
-	if (lib_device->supported_samplerates == NULL)
+	else
 	{
+		/* Firmware that does not list its rates: the Airspy R2's before the list, whose
+		   indices LPC4370SDR_SAMPLERATE_10MSPS and _2_5MSPS are */
 		lib_device->supported_samplerate_count = 2;
 		lib_device->supported_samplerates = (uint32_t *) malloc(lib_device->supported_samplerate_count * sizeof(uint32_t));
-		if (lib_device->supported_samplerates == NULL)
+		result = LPC4370SDR_ERROR_NO_MEM;
+		if (lib_device->supported_samplerates != NULL)
 		{
-			lpc4370sdr_open_exit(lib_device);
-			free(lib_device);
-			return LPC4370SDR_ERROR_NO_MEM;
+			lib_device->supported_samplerates[0] = 10000000;
+			lib_device->supported_samplerates[1] = 2500000;
+			result = LPC4370SDR_SUCCESS;
 		}
-		lib_device->supported_samplerates[0] = 10000000;
-		lib_device->supported_samplerates[1] = 2500000;
+	}
+	if (result != LPC4370SDR_SUCCESS)
+	{
+		free(lib_device->supported_samplerates);
+		lpc4370sdr_open_exit(lib_device);
+		destroy_sync(lib_device);
+		free(lib_device);
+		return result;
 	}
 
 	lpc4370sdr_set_packing(lib_device, 0);
@@ -2362,6 +2415,7 @@ static int lpc4370sdr_open_init(lpc4370sdr_device_t** device, uint64_t serial_nu
 		iqconverter_int16_free(lib_device->cnv_i);
 		lpc4370sdr_open_exit(lib_device);
 		free(lib_device->supported_samplerates);
+		destroy_sync(lib_device);
 		free(lib_device);
 		return LPC4370SDR_ERROR_NO_MEM;
 	}
@@ -2515,16 +2569,16 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 
 			result = lpc4370sdr_stop_rx(device);
 
+			/* libusb still holds transfers (reap_transfers() gave up): they would complete into
+			   freed memory, so the device stays open */
+			if (free_transfers(device) != LPC4370SDR_SUCCESS)
+			{
+				return LPC4370SDR_ERROR_BUSY;
+			}
+
 			iqconverter_float_free(device->cnv_f);
 			iqconverter_int16_free(device->cnv_i);
-
-			pthread_cond_destroy(&device->consumer_cv);
-			pthread_mutex_destroy(&device->consumer_mp);
-			pthread_cond_destroy(&device->dsp_cv);
-			pthread_mutex_destroy(&device->dsp_mp);
-			pthread_mutex_destroy(&device->state_mp);
-
-			free_transfers(device);
+			destroy_sync(device);
 			lpc4370sdr_open_exit(device);
 			free(device->supported_samplerates);
 			free(device);
@@ -2537,6 +2591,10 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 	{
 		uint32_t i;
 
+		if (buffer == NULL)
+		{
+			return LPC4370SDR_ERROR_INVALID_PARAM;
+		}
 		if (len == 0)
 		{
 			*buffer = device->supported_samplerate_count;
@@ -2567,12 +2625,14 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 		uint8_t retval;
 		uint8_t length;
 		uint32_t i;
+		/* The list holds I/Q rates; the real types run at twice them (lpc4370sdr_get_samplerates()) */
+		const uint64_t scale = SAMPLE_TYPE_IS_IQ(device->sample_type) ? 1 : 2;
 
 		if (samplerate >= MIN_SAMPLERATE_BY_VALUE)
 		{
 			for (i = 0; i < device->supported_samplerate_count; i++)
 			{
-				if (samplerate == device->supported_samplerates[i])
+				if (samplerate == device->supported_samplerates[i] * scale)
 				{
 					samplerate = i;
 					break;
@@ -2581,15 +2641,28 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 
 			if (samplerate >= MIN_SAMPLERATE_BY_VALUE)
 			{
-				if (SAMPLE_TYPE_IS_IQ(device->sample_type))
+				/* Any other rate goes to the device as its ADC rate in kHz, in the 16-bit wIndex */
+				const uint64_t khz = (uint64_t)samplerate * (2 / scale) / 1000;
+				if (khz > 0xFFFF)
 				{
-					samplerate *= 2;
+					return LPC4370SDR_ERROR_INVALID_PARAM;
 				}
-				samplerate /= 1000;
+				samplerate = (uint32_t)khz;
 			}
 		}
+		if (samplerate > 0xFFFF)
+		{
+			return LPC4370SDR_ERROR_INVALID_PARAM;
+		}
 
-		libusb_clear_halt(device->usb_device, LIBUSB_ENDPOINT_IN | 1);
+		/* Not while streaming: the device resets its data toggle at the CLEAR_FEATURE, the host
+		   does not while transfers are queued, and the next packet would be lost.
+		   lpc4370sdr_start_rx() clears it anyway. */
+		if (lock_idle(device))
+		{
+			libusb_clear_halt(device->usb_device, LIBUSB_ENDPOINT_IN | 1);
+			pthread_mutex_unlock(&device->state_mp);
+		}
 
 		length = 1;
 
@@ -2639,7 +2712,7 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 	{
 		int result;
 
-		if (device->streaming || on_callback_thread(device))
+		if (get_flag(&device->streaming) || on_callback_thread(device))
 		{
 			return LPC4370SDR_ERROR_BUSY;
 		}
@@ -2647,7 +2720,7 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 		   lpc4370sdr_stop_rx(): take its threads and transfers back first */
 		if (io_busy(device))
 		{
-			device->stop_requested = true;
+			set_flag(&device->stop_requested, true);
 			kill_io_threads(device);
 		}
 		/* After a failed reallocation in lpc4370sdr_set_packing() */
@@ -2708,6 +2781,10 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 		{
 			device->ctx = ctx;
 			result = create_io_threads(device, callback);
+			if (result != LPC4370SDR_SUCCESS)
+			{
+				lpc4370sdr_set_receiver_mode(device, RECEIVER_MODE_OFF);
+			}
 		}
 
 		return result;
@@ -2717,6 +2794,10 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 	{
 		int result;
 
+		if (callback == NULL)
+		{
+			return LPC4370SDR_ERROR_INVALID_PARAM;
+		}
 		if (!lock_state(device))
 		{
 			return LPC4370SDR_ERROR_BUSY;
@@ -2733,10 +2814,10 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 		if (!lock_state(device))
 		{
 			/* A sample callback while another thread stops or starts the stream */
-			device->streaming = false;
+			set_flag(&device->streaming, false);
 			return LPC4370SDR_SUCCESS;
 		}
-		device->stop_requested = true;
+		set_flag(&device->stop_requested, true);
 		result1 = lpc4370sdr_set_receiver_mode(device, RECEIVER_MODE_OFF);
 		result2 = kill_io_threads(device);
 		pthread_mutex_unlock(&device->state_mp);
@@ -2752,6 +2833,11 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 	{
 		uint8_t temp_value;
 		int result;
+
+		if (value == NULL)
+		{
+			return LPC4370SDR_ERROR_INVALID_PARAM;
+		}
 
 		temp_value = 0;
 		result = libusb_control_transfer(
@@ -2801,6 +2887,11 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 	{
 		int result;
 
+		if (value == NULL)
+		{
+			return LPC4370SDR_ERROR_INVALID_PARAM;
+		}
+
 		result = libusb_control_transfer(
 			device->usb_device,
 			LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE,
@@ -2847,6 +2938,11 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 	{
 		int result;
 		uint8_t port_pin;
+
+		if (value == NULL)
+		{
+			return LPC4370SDR_ERROR_INVALID_PARAM;
+		}
 
 		port_pin = ((uint8_t)port) << 5;
 		port_pin = port_pin | pin;
@@ -2902,6 +2998,11 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 	{
 		int result;
 		uint8_t port_pin;
+
+		if (value == NULL)
+		{
+			return LPC4370SDR_ERROR_INVALID_PARAM;
+		}
 
 		port_pin = ((uint8_t)port) << 5;
 		port_pin = port_pin | pin;
@@ -3000,7 +3101,7 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 	{
 		int result;
 
-		if (address > 0x0FFFFF)
+		if (address > 0x0FFFFF || (data == NULL && length > 0))
 		{
 			return LPC4370SDR_ERROR_INVALID_PARAM;
 		}
@@ -3028,6 +3129,11 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 	{
 		int result;
 
+		if (data == NULL && length > 0)
+		{
+			return LPC4370SDR_ERROR_INVALID_PARAM;
+		}
+
 		result = libusb_control_transfer(
 			device->usb_device,
 			LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE,
@@ -3052,6 +3158,11 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 		int result;
 		uint32_t* words = (uint32_t*)status;
 		size_t i;
+
+		if (status == NULL)
+		{
+			return LPC4370SDR_ERROR_INVALID_PARAM;
+		}
 
 		result = libusb_control_transfer(
 			device->usb_device,
@@ -3082,6 +3193,11 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 	int ADDCALL lpc4370sdr_board_id_read(lpc4370sdr_device_t* device, uint8_t* value)
 	{
 		int result;
+
+		if (value == NULL)
+		{
+			return LPC4370SDR_ERROR_INVALID_PARAM;
+		}
 		result = libusb_control_transfer(
 			device->usb_device,
 			LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE,
@@ -3106,6 +3222,11 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 #define VERSION_LOCAL_SIZE (128)
 		int result;
 		char version_local[VERSION_LOCAL_SIZE] = "";
+
+		if (version == NULL)
+		{
+			return LPC4370SDR_ERROR_INVALID_PARAM;
+		}
 
 		result = libusb_control_transfer(
 			device->usb_device,
@@ -3141,6 +3262,11 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 	{
 		uint8_t length;
 		int result;
+
+		if (read_partid_serialno == NULL)
+		{
+			return LPC4370SDR_ERROR_INVALID_PARAM;
+		}
 
 		length = sizeof(lpc4370sdr_read_partid_serialno_t);
 		result = libusb_control_transfer(
@@ -3338,12 +3464,16 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 	{
 		double d = 0;
 		uint32_t m = 1;
+		bool locked;
 
 		if (device == NULL)
 		{
 			return LPC4370SDR_ERROR_INVALID_PARAM;
 		}
-		pthread_mutex_lock(&device->state_mp);
+		/* A sample callback reads without the lock when another thread holds it (and may be
+		   waiting for the callback): the sample type and the converters stay as they are while
+		   the stream runs */
+		locked = lock_state(device);
 		/* the converters keep half the kernel and its centre: len = L / 2 + 1, so (L - 1) / 4 = (len - 1) / 2 */
 		if (device->sample_type == LPC4370SDR_SAMPLE_FLOAT32_IQ)
 		{
@@ -3355,7 +3485,10 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 			d = (device->cnv_i->len - 1) / 2.0;
 			m = 2;
 		}
-		pthread_mutex_unlock(&device->state_mp);
+		if (locked)
+		{
+			pthread_mutex_unlock(&device->state_mp);
+		}
 		if (delay != NULL)
 		{
 			*delay = d;
@@ -3632,7 +3765,7 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 	{
 		int result;
 		uint8_t retval;
-		bool packing_enabled;
+		bool packing_enabled, realloc_buffers;
 
 		/* 0 = 16-bit, 1 = 12-bit, 2 = 12-bit with a chunk counter and the ADC status, 3 = 8-bit */
 		if (value > 3)
@@ -3640,6 +3773,18 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 			return LPC4370SDR_ERROR_INVALID_PARAM;
 		}
 
+		/* The buffers go first: when they cannot, the device keeps the packing they are sized for */
+		realloc_buffers = value != device->packing_mode || device->transfers == NULL;
+		if (realloc_buffers)
+		{
+			result = free_transfers(device);
+			if (result != LPC4370SDR_SUCCESS)
+			{
+				return result;
+			}
+		}
+
+		/* On failure from here on the buffers stay unallocated: lpc4370sdr_start_rx() tries again */
 		result = libusb_control_transfer(
 			device->usb_device,
 			LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE,
@@ -3656,19 +3801,12 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 		}
 
 		packing_enabled = value ? true : false;
-		if (value != device->packing_mode || device->transfers == NULL)
+		if (realloc_buffers)
 		{
-			result = free_transfers(device);
-			if (result != LPC4370SDR_SUCCESS)
-			{
-				return result;
-			}
-
 			device->packing_enabled = packing_enabled;
 			device->packing_mode = value;
 			device->buffer_size = value == 3 ? (4096 * 36) : packing_enabled ? (6144 * 24) : 262144;
 
-			/* On failure the buffers stay unallocated: lpc4370sdr_start_rx() tries again */
 			result = allocate_transfers(device);
 			if (result != LPC4370SDR_SUCCESS)
 			{
@@ -3713,7 +3851,7 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 
 	int ADDCALL lpc4370sdr_set_gap_fill(lpc4370sdr_device_t* device, uint8_t enabled)
 	{
-		device->gap_fill = enabled ? true : false;
+		set_flag(&device->gap_fill, enabled != 0);
 		return LPC4370SDR_SUCCESS;
 	}
 
@@ -3798,7 +3936,7 @@ int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int count)
 
 	int ADDCALL lpc4370sdr_is_streaming(lpc4370sdr_device_t* device)
 	{
-		return (device->streaming == true && device->stop_requested == false);
+		return stream_running(device);
 	}
 
 	const char* ADDCALL lpc4370sdr_error_name(enum lpc4370sdr_error errcode)
@@ -3893,7 +4031,7 @@ int ADDCALL lpc4370sdr_set_uart_baud(struct lpc4370sdr_device* device, uint32_t 
 int ADDCALL lpc4370sdr_uart_write(struct lpc4370sdr_device* device, const uint8_t* data, uint16_t len)
 {
 	int result;
-	if (len == 0 || len > 64)
+	if (data == NULL || len == 0 || len > 64)
 		return LPC4370SDR_ERROR_INVALID_PARAM;
 	result = libusb_control_transfer(
 		device->usb_device,
@@ -3928,7 +4066,10 @@ int ADDCALL lpc4370sdr_set_calibration(struct lpc4370sdr_device* device, int32_t
 
 int ADDCALL lpc4370sdr_get_calibration(struct lpc4370sdr_device* device, lpc4370sdr_calibration_t* calibration)
 {
-	int result = libusb_control_transfer(
+	int result;
+	if (calibration == NULL)
+		return LPC4370SDR_ERROR_INVALID_PARAM;
+	result = libusb_control_transfer(
 		device->usb_device,
 		LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE,
 		LPC4370SDR_GET_CALIBRATION,
@@ -3947,7 +4088,7 @@ int ADDCALL lpc4370sdr_get_calibration(struct lpc4370sdr_device* device, lpc4370
 int ADDCALL lpc4370sdr_mem_read(struct lpc4370sdr_device* device, uint32_t address, void* data, uint16_t len)
 {
 	int result;
-	if (len == 0 || len > 64)
+	if (data == NULL || len == 0 || len > 64)
 		return LPC4370SDR_ERROR_INVALID_PARAM;
 	result = libusb_control_transfer(
 		device->usb_device,
@@ -3966,7 +4107,7 @@ int ADDCALL lpc4370sdr_mem_read(struct lpc4370sdr_device* device, uint32_t addre
 int ADDCALL lpc4370sdr_mem_write(struct lpc4370sdr_device* device, uint32_t address, const void* data, uint16_t len)
 {
 	int result;
-	if (len == 0 || len > 64)
+	if (data == NULL || len == 0 || len > 64)
 		return LPC4370SDR_ERROR_INVALID_PARAM;
 	result = libusb_control_transfer(
 		device->usb_device,
@@ -4027,4 +4168,19 @@ int ADDCALL lpc4370sdr_call(struct lpc4370sdr_device* device, uint32_t core, uin
 #endif
 		waited++;
 	}
+}
+
+int ADDCALL lpc4370sdr_reset(struct lpc4370sdr_device* device)
+{
+	uint8_t retval;
+	/* The device reboots as the request arrives and never answers it */
+	int result = libusb_control_transfer(
+		device->usb_device,
+		LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE,
+		LPC4370SDR_RESET, 0, 0, &retval, 1, LIBUSB_CTRL_TIMEOUT_MS);
+	if (result == LIBUSB_ERROR_TIMEOUT || result == LIBUSB_ERROR_IO || result == LIBUSB_ERROR_NO_DEVICE)
+		return LPC4370SDR_SUCCESS;
+	if (result == LIBUSB_ERROR_PIPE)
+		return LPC4370SDR_ERROR_UNSUPPORTED; /* firmware without it (Airspy's) stalls the request */
+	return (result < 0) ? LPC4370SDR_ERROR_LIBUSB : LPC4370SDR_ERROR_OTHER;
 }

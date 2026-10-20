@@ -44,6 +44,8 @@ typedef enum
   Note: lpc4370sdr_samplerate_t is now obsolete and left for backward compatibility.
   The list of supported sample rates should be retrieved at run time by calling lpc4370sdr_get_samplerates().
   Refer to the lpc4370sdr tools for illustrations.
+  The indices are the Airspy R2's (and those of its old firmware, which has no list): on the other
+  boards index 1 is another rate (5 MSPS on the HydraSDR RFOne, 3 MSPS on the Airspy Mini).
 */
 typedef enum 
 {
@@ -56,11 +58,11 @@ typedef enum
 #define LPC4370SDR_CONF_CMD_SHIFT_BIT (3) // Up to 3bits=8 samplerates (lpc4370sdr_samplerate_t enum shall not exceed 7)
 
 // Commands (usb vendor request) shared between Firmware and Host.
-#define LPC4370SDR_CMD_MAX (27)
+#define LPC4370SDR_CMD_MAX (28)
 #define LPC4370SDR_EXT_CMD_BASE (0x80)
 typedef enum
 {
-    LPC4370SDR_INVALID                    = 0 ,
+    LPC4370SDR_RESET                      = 0 , /* the device reboots at once, without answering: lpc4370sdr_reset() */
     LPC4370SDR_RECEIVER_MODE              = 1 ,
     LPC4370SDR_SI5351C_WRITE              = 2 ,
     LPC4370SDR_SI5351C_READ               = 3 ,
@@ -87,9 +89,10 @@ typedef enum
     LPC4370SDR_GPIODIR_READ               = 24,
     LPC4370SDR_GET_SAMPLERATES            = 25,
     LPC4370SDR_SET_PACKING                = 26,
-    LPC4370SDR_SPIFLASH_ERASE_SECTOR      = LPC4370SDR_CMD_MAX,
-    LPC4370SDR_SET_RF_PORT                = LPC4370SDR_CMD_MAX + 1, /* IN, wIndex = lpc4370sdr_rf_port_t; returns 1; HydraSDR RFOne only */
-    /* Stream metadata, timing and debug commands, the same numbers as on the HydraSDR RFOne */
+    LPC4370SDR_SPIFLASH_ERASE_SECTOR      = 27,
+    LPC4370SDR_SET_RF_PORT                = LPC4370SDR_CMD_MAX, /* IN, wIndex = lpc4370sdr_rf_port_t; returns 1; HydraSDR RFOne only */
+    /* Stream metadata, timing and debug commands of the lpc4370sdr firmware, on every board: kept clear
+       of the Airspy and HydraSDR range (29..33 are hydrasdr-host v1.1's, which this firmware stalls) */
     LPC4370SDR_GET_STREAM_STATUS          = LPC4370SDR_EXT_CMD_BASE + 0,
     LPC4370SDR_SET_FRAMING                = LPC4370SDR_EXT_CMD_BASE + 1,
     LPC4370SDR_WATCHDOG                   = LPC4370SDR_EXT_CMD_BASE + 2,
@@ -101,7 +104,7 @@ typedef enum
     LPC4370SDR_MEM_READ                   = LPC4370SDR_EXT_CMD_BASE + 7, /* IN: wValue | wIndex << 16 = address, wLength <= 64 bytes */
     LPC4370SDR_MEM_WRITE                  = LPC4370SDR_EXT_CMD_BASE + 8, /* OUT: same addressing, data = bytes to write */
     LPC4370SDR_CALL                       = LPC4370SDR_EXT_CMD_BASE + 9, /* OUT: lpc4370sdr_call_request_t runs a function; IN: lpc4370sdr_call_result_t */
-    LPC4370SDR_SET_SOF_DIVIDER            = LPC4370SDR_EXT_CMD_BASE + 10 /* wValue | wIndex << 16 = divider: tag the first SOF of every USB frame whose number is a multiple of it, 0 = off; cleared at every stream stop */
+    LPC4370SDR_SET_SOF_DIVIDER            = LPC4370SDR_EXT_CMD_BASE + 10 /* wValue | wIndex << 16 = divider: tag the first SOF of every USB frame whose number is a multiple of it, 0 = off; kept by the restart a setting change performs, cleared when the receiver goes off */
 } lpc4370sdr_vendor_request;
 
 #define LPC4370SDR_FRAME_HEADER_SIZE (96)
@@ -151,8 +154,10 @@ typedef struct
  * The chunk header, version 2. Fields that only grow are sent modulo 2^16 (a host extends them from
  * one header to the next: they never move 2^15 between two chunks); the chunk's 64-bit sample index
  * is chunk_index (extended past its 32-bit wrap by the host) times sample_count. The PPS edge's and
- * the SOF's sample indices are sent as their low words: the edge is never 2^31 samples from the
- * chunk that reports it. ext[] carries items a host need not know to stay in step - see
+ * the SOF's 64-bit sample indices are sent as their low words, which a host extends from the
+ * chunk's sample index: only while the edge is less than 2^31 samples behind the chunk. The last
+ * edge stays in the headers when the input stops, so a host takes an edge only when pps_count
+ * (sof_count) changed. ext[] carries items a host need not know to stay in step - see
  * LPC4370SDR_EXT_*. check makes a header hard to mistake for sample data when a host looks for the
  * chunk boundaries again.
  */
@@ -162,7 +167,7 @@ typedef struct
 typedef struct
 {
 	uint32_t magic;          /* LPC4370SDR_FRAME_MAGIC */
-	uint32_t chunk_index;    /* chunk number since stream start (wraps; the device's counter is 64-bit) */
+	uint32_t chunk_index;    /* chunk number since stream start (the device's counter is 32-bit too: it wraps) */
 	uint8_t version;         /* LPC4370SDR_FRAME_VERSION */
 	uint8_t flags;           /* LPC4370SDR_FRAME_FLAG_* */
 	uint8_t stream_start_count; /* streams started since power-on (mod 256): it changes when a setting change

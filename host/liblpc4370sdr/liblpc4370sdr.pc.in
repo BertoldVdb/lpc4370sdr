@@ -8,4 +8,5 @@ Description: C Utility Library
 Version: @VERSION@
 Cflags: -I${includedir}/liblpc4370sdr/ @LPC4370SDR_PC_CFLAGS@
 Libs: -L${libdir} -llpc4370sdr
+Requires.private: libusb-1.0
 Libs.private: @LPC4370SDR_PC_LIBS@

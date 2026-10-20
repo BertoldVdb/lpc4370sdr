@@ -134,7 +134,7 @@
     <ClCompile Include=".\getopt\getopt1.c" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\getopt\getopt.h" />
+    <ClInclude Include=".\getopt\getopt.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

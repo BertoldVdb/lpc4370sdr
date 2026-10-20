@@ -52,7 +52,8 @@ endif(MINGW)
 # Dynamic library
 add_library(lpc4370sdr SHARED ${c_sources} ${LPC4370SDR_DLL_SRCS})
 set_target_properties(lpc4370sdr PROPERTIES VERSION ${LPC4370SDR_VER_MAJOR}.${LPC4370SDR_VER_MINOR}.${LPC4370SDR_VER_REVISION})
-set_target_properties(lpc4370sdr PROPERTIES SOVERSION 0)
+# While the major version is 0 every minor version breaks binary compatibility (lpc4370sdr.h): the SONAME has both
+set_target_properties(lpc4370sdr PROPERTIES SOVERSION ${LPC4370SDR_VER_MAJOR}.${LPC4370SDR_VER_MINOR})
 # Export the API only (LPC4370SDR_API), and link every symbol the library uses
 set_target_properties(lpc4370sdr PROPERTIES C_VISIBILITY_PRESET hidden)
 if(UNIX AND NOT APPLE)
@@ -74,11 +75,14 @@ else()
 endif()
 
 set_target_properties(lpc4370sdr-static PROPERTIES C_VISIBILITY_PRESET hidden)
+# Neither exported nor imported on Windows, for the library and the programs that link it
+target_compile_definitions(lpc4370sdr-static PUBLIC LPC4370SDR_STATIC)
 set_target_properties(lpc4370sdr PROPERTIES CLEAN_DIRECT_OUTPUT 1)
 set_target_properties(lpc4370sdr-static PROPERTIES CLEAN_DIRECT_OUTPUT 1)
 
 # Dependencies
 target_link_libraries(lpc4370sdr ${LIBUSB_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(lpc4370sdr-static INTERFACE ${LIBUSB_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
    
 # For cygwin just force UNIX OFF and WIN32 ON
 if( ${CYGWIN} )

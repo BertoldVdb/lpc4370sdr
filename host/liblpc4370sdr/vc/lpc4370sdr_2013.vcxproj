@@ -85,7 +85,7 @@
     <IntDir Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(SolutionDir)..\$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
-    <LibraryPath>$(projecdir)..\..\libusb-1.0.20\MS32\dll;$(projecdir)..\..\libpthread-2-9-1-win\lib\x86;$(LibraryPath)</LibraryPath>
+    <LibraryPath>$(projectdir)..\..\libusb-1.0.20\MS32\dll;$(projectdir)..\..\libpthread-2-9-1-win\lib\x86;$(LibraryPath)</LibraryPath>
     <IncludePath>$(projectdir)..\..\libusb-1.0.20\include\libusb-1.0;$(projectdir)..\..\libpthread-2-9-1-win\include;$(IncludePath)</IncludePath>
     <CustomBuildAfterTargets>Build</CustomBuildAfterTargets>
   </PropertyGroup>
@@ -95,7 +95,7 @@
     <CustomBuildAfterTargets>Build</CustomBuildAfterTargets>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
-    <LibraryPath>$(projecdir)..\..\libusb-1.0.20\MS32\dll;$(projecdir)..\..\libpthread-2-9-1-win\lib\x86;$(LibraryPath)</LibraryPath>
+    <LibraryPath>$(projectdir)..\..\libusb-1.0.20\MS32\dll;$(projectdir)..\..\libpthread-2-9-1-win\lib\x86;$(LibraryPath)</LibraryPath>
     <IncludePath>$(projectdir)..\..\libusb-1.0.20\include\libusb-1.0;$(projectdir)..\..\libpthread-2-9-1-win\include;$(IncludePath)</IncludePath>
     <CustomBuildAfterTargets>Build</CustomBuildAfterTargets>
   </PropertyGroup>
@@ -146,9 +146,6 @@
     <ProjectReference>
       <LinkLibraryDependencies>false</LinkLibraryDependencies>
     </ProjectReference>
-    <PostBuildEvent>
-      <Command>copy .\libs\$(Platform)\*.dll $(OutDir)</Command>
-    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
@@ -192,9 +189,6 @@
     <ProjectReference>
       <LinkLibraryDependencies>false</LinkLibraryDependencies>
     </ProjectReference>
-    <PostBuildEvent>
-      <Command>copy .\libs\$(Platform)\*.dll $(OutDir)</Command>
-    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <ClCompile>
@@ -244,9 +238,6 @@
     <ProjectReference>
       <LinkLibraryDependencies>false</LinkLibraryDependencies>
     </ProjectReference>
-    <PostBuildEvent>
-      <Command>copy .\libs\$(Platform)\*.dll $(OutDir)</Command>
-    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
@@ -296,9 +287,6 @@
     <ProjectReference>
       <LinkLibraryDependencies>false</LinkLibraryDependencies>
     </ProjectReference>
-    <PostBuildEvent>
-      <Command>copy .\libs\$(Platform)\*.dll $(OutDir)</Command>
-    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\src\lpc4370sdr.c" />
@@ -311,7 +299,6 @@
     <ClInclude Include="..\src\iqconverter_float.c" />
     <ClInclude Include="..\src\iqconverter_int16.h" />
     <ClInclude Include="..\src\iqconverter_int16.c" />
-    <ClInclude Include="..\src\win32\resource.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\src\win32\lpc4370sdr.rc" />

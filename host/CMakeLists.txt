@@ -1,7 +1,7 @@
 #top dir cmake project for liblpc4370sdr + lpc4370sdr-tools
 
-cmake_minimum_required(VERSION 3.5)
-project (lpc4370sdr_all)
+cmake_minimum_required(VERSION 3.10)
+project (lpc4370sdr_all C)
 
 #provide missing strtoull() for VC11
 if(MSVC11)

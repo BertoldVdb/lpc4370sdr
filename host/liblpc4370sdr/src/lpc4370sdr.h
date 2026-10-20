@@ -42,17 +42,26 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSI
    0.3.1: lpc4370sdr_usb_position() added (binary compatible with 0.3.0)
    0.3.2: lpc4370sdr_get_conversion_delay() added (binary compatible with 0.3.0)
    0.3.3: the I/Q converters, filter kernels and gain tables are no longer exported
-   (binary compatible with 0.3.0) */
-#define LPC4370SDR_VERSION "0.3.3"
+   (binary compatible with 0.3.0)
+   0.4.0: lpc4370sdr_transfer_metadata_t grew uart_dropped; lpc4370sdr_reset() added;
+   lpc4370sdr_set_samplerate() takes the real types' rates as lpc4370sdr_get_samplerates() lists
+   them (it took their I/Q rate, half that); LPC4370SDR_INVALID is LPC4370SDR_RESET: rebuild
+   programs built against 0.3
+   While the major version is 0, the minor version changes with every change that breaks binary
+   compatibility, and the shared library's SONAME carries both (liblpc4370sdr.so.0.4): a program
+   built against another minor version does not load this one. */
+#define LPC4370SDR_VERSION "0.4.0"
 #define LPC4370SDR_VER_MAJOR 0
-#define LPC4370SDR_VER_MINOR 3
-#define LPC4370SDR_VER_REVISION 3
+#define LPC4370SDR_VER_MINOR 4
+#define LPC4370SDR_VER_REVISION 0
 
 #ifdef _WIN32
-	 #define ADD_EXPORTS
-	 
-	/* You should define ADD_EXPORTS *only* when building the DLL. */
-	#ifdef ADD_EXPORTS
+	/* The DLL build exports the API (CMake defines lpc4370sdr_EXPORTS for it), its users import it;
+	   a static library (LPC4370SDR_STATIC) or a library that has it built in (LPC4370SDR_NO_EXPORT,
+	   like the libairspy compatibility one) does neither */
+	#if defined(LPC4370SDR_STATIC) || defined(LPC4370SDR_NO_EXPORT)
+		#define LPC4370SDR_API
+	#elif defined(lpc4370sdr_EXPORTS)
 		#define LPC4370SDR_API __declspec(dllexport)
 	#else
 		#define LPC4370SDR_API __declspec(dllimport)
@@ -230,11 +239,11 @@ typedef struct {
 	uint32_t sync_errors; /* chunks with an invalid header since the stream started */
 	uint32_t duplicate_chunks; /* chunks in this block whose samples had already been delivered */
 	uint32_t freq_hz;
-	/* External PPS input, from the block's last chunk */
+	/* External PPS input, from the block's last chunk: the last edge captured (when pps_count is not 0) */
 	uint64_t pps_sample_index;
 	uint32_t pps_fraction; /* position of the edge within that sample, in 1/2^32 sample units */
 	uint32_t pps_count; /* PPS edges captured since the stream started */
-	/* Bytes received on the device's auxiliary UART */
+	/* Bytes received on the device's auxiliary UART (more than fit: uart_dropped) */
 	uint32_t uart_len;
 	uint8_t uart_data[LPC4370SDR_METADATA_UART_MAX];
 	uint32_t flags;          /* LPC4370SDR_FRAME_FLAG_* of the first chunk */
@@ -285,6 +294,9 @@ typedef struct {
 	lpc4370sdr_ext_area_t ext[LPC4370SDR_METADATA_EXT_MAX];
 	uint32_t ext_dropped;
 	uint32_t ext_malformed;
+	/* UART bytes that did not fit in uart_data, since lpc4370sdr_start_rx(): they come right after
+	   uart_data's, and the next block's uart_offset is past them */
+	uint32_t uart_dropped;
 } lpc4370sdr_transfer_metadata_t;
 
 
@@ -300,15 +312,25 @@ extern LPC4370SDR_API int ADDCALL lpc4370sdr_list_devices(uint64_t *serials, int
 
 extern LPC4370SDR_API int ADDCALL lpc4370sdr_open_sn(struct lpc4370sdr_device** device, uint64_t serial_number);
 extern LPC4370SDR_API int ADDCALL lpc4370sdr_open_fd(struct lpc4370sdr_device** device, int fd);
+/* LPC4370SDR_ERROR_BUSY when the device (lpc4370sdr_open_sn(): the one with that serial number) is
+   there but another program, or another handle, has it */
 extern LPC4370SDR_API int ADDCALL lpc4370sdr_open(struct lpc4370sdr_device** device);
+/* LPC4370SDR_ERROR_BUSY from a sample callback, or when libusb does not give the stream's transfers
+   back: the device then stays open (try again) */
 extern LPC4370SDR_API int ADDCALL lpc4370sdr_close(struct lpc4370sdr_device* device);
 
 /* Use lpc4370sdr_get_samplerates(device, buffer, 0) to get the number of available sample rates. It will be returned in the first element of buffer */
 extern LPC4370SDR_API int ADDCALL lpc4370sdr_get_samplerates(struct lpc4370sdr_device* device, uint32_t* buffer, const uint32_t len);
 
-/* Parameter samplerate can be either the index of a samplerate or directly its value in Hz within the list returned by lpc4370sdr_get_samplerates() */
+/* Parameter samplerate can be either the index of a samplerate or directly its value in Hz within the list returned by lpc4370sdr_get_samplerates()
+   for the sample type in force: the real types run at twice the I/Q rates, and their list says so. Another value (from 1 MHz) asks the
+   device for that rate, which it may have outside its list; LPC4370SDR_ERROR_INVALID_PARAM above 65.535 MHz of ADC rate. Can be changed while
+   streaming: the device restarts the stream (stream_restarts in the metadata). */
 extern LPC4370SDR_API int ADDCALL lpc4370sdr_set_samplerate(struct lpc4370sdr_device* device, uint32_t samplerate);
 
+/* The kernel is a half-band one of 4k + 3 taps: zeros at the odd indices other than the centre (float: at most a
+   millionth of the centre tap); int16: centre tap 16384 and the taps at the even indices summing to at most 65535 in
+   magnitude. Other kernels return LPC4370SDR_ERROR_INVALID_PARAM. Not while streaming. */
 extern LPC4370SDR_API int ADDCALL lpc4370sdr_set_conversion_filter_float32(struct lpc4370sdr_device* device, const float *kernel, const uint32_t len);
 extern LPC4370SDR_API int ADDCALL lpc4370sdr_set_conversion_filter_int16(struct lpc4370sdr_device* device, const int16_t *kernel, const uint32_t len);
 /* The I/Q conversion removes the ADC's DC before the fs/4 translation (the default, 1). That DC
@@ -351,6 +373,9 @@ extern LPC4370SDR_API int ADDCALL lpc4370sdr_spiflash_write(struct lpc4370sdr_de
 extern LPC4370SDR_API int ADDCALL lpc4370sdr_spiflash_read(struct lpc4370sdr_device* device, const uint32_t address, const uint16_t length, unsigned char* data);
 
 extern LPC4370SDR_API int ADDCALL lpc4370sdr_board_id_read(struct lpc4370sdr_device* device, uint8_t* value);
+/* Reboot the device (lpc4370sdr firmware, LPC4370SDR_RESET): it drops off the USB and enumerates again, so
+   the handle is of no further use but to lpc4370sdr_close() it. LPC4370SDR_ERROR_UNSUPPORTED from the Airspy firmware. */
+extern LPC4370SDR_API int ADDCALL lpc4370sdr_reset(struct lpc4370sdr_device* device);
 /* Parameter length shall be at least 128bytes to avoid possible string clipping */
 extern LPC4370SDR_API int ADDCALL lpc4370sdr_version_string_read(struct lpc4370sdr_device* device, char* version, uint8_t length);
 
