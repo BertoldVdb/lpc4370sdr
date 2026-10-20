@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <getopt.h>
 
 #include <stdbool.h>
@@ -80,9 +81,14 @@ int parse_u64(char* s, uint64_t* const value) {
 		}
 	}
 
+	/* strtoull() takes a sign, and wraps a negative value around */
+	if( strchr(s, '-') != NULL ) {
+		return LPC4370SDR_ERROR_INVALID_PARAM;
+	}
 	s_end = s;
+	errno = 0;
 	u64_value = strtoull(s, &s_end, base);
-	if( (s != s_end) && (*s_end == 0) ) {
+	if( (s != s_end) && (*s_end == 0) && (errno == 0) ) {
 		*value = u64_value;
 		return LPC4370SDR_SUCCESS;
 	} else {
@@ -227,20 +233,56 @@ int main(int argc, char** argv) {
 	uint32_t serial_number_lsb_val;
 	int result, op_result;
 
+	/* Check every option before the device is opened: no register is written when one is wrong */
 	option_index = 0;
 	while( (opt = getopt_long(argc, argv,  "cn:rw:s:", long_options, &option_index)) != EOF )
 	{
+		result = LPC4370SDR_SUCCESS;
 		switch( opt ) {
 
 		case 's':
 			serial_number = true;
 			result = parse_u64(optarg, &serial_number_val);
+			if( result != LPC4370SDR_SUCCESS ) {
+				break;
+			}
 			serial_number_msb_val = (uint32_t)(serial_number_val >> 32);
 			serial_number_lsb_val = (uint32_t)(serial_number_val & 0xFFFFFFFF);
 			printf("Board serial number to open: 0x%08X%08X\n", serial_number_msb_val, serial_number_lsb_val);
 			break;
+
+		case 'n':
+			result = parse_int(optarg, &register_number);
+			n_opt = 1;
+			break;
+
+		case 'w':
+			if( n_opt == 0 ) {
+				printf("Error parameter -w needs -n first\n");
+				result = LPC4370SDR_ERROR_INVALID_PARAM;
+				break;
+			}
+			result = parse_int(optarg, &register_value);
+			break;
+
+		case 'r':
+		case 'c':
+			break;
+
+		default:
+			/* getopt said which */
+			usage();
+			return EXIT_FAILURE;
+		}
+
+		if( result != LPC4370SDR_SUCCESS ) {
+			printf("argument error: '-%c %s' %s (%d)\n", opt, optarg ? optarg : "", lpc4370sdr_error_name(result), result);
+			usage();
+			return EXIT_FAILURE;
 		}
 	}
+	n_opt = 0;
+	register_number = 0;
 
 	result = lpc4370sdr_init();
 	if( result ) {

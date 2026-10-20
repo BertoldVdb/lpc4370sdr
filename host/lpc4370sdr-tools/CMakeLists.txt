@@ -22,7 +22,7 @@
 
 # Based heavily upon the libftdi cmake setup.
 
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.10)
 project(lpc4370sdr-tools C)
 set(MAJOR_VERSION 0)
 set(MINOR_VERSION 2)
@@ -76,10 +76,12 @@ endif()
 # Install udev rules
 ########################################################################
 option(INSTALL_UDEV_RULES "Install udev rules for lpc4370sdr boards" OFF)
+# The local administrator's directory, whatever CMAKE_INSTALL_PREFIX is; packages use /usr/lib/udev/rules.d
+set(UDEV_RULES_PATH "/etc/udev/rules.d" CACHE STRING "Directory the udev rules are installed to")
 if (INSTALL_UDEV_RULES)
     install (
         FILES 52-lpc4370sdr.rules
-        DESTINATION "/etc/udev/rules.d"
+        DESTINATION "${UDEV_RULES_PATH}"
         COMPONENT "udev"
         )
 else (INSTALL_UDEV_RULES)

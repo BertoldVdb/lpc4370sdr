@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <getopt.h>
 
 #include <stdbool.h>
@@ -95,9 +96,14 @@ int parse_u64(char* s, uint64_t* const value) {
 		}
 	}
 
+	/* strtoull() takes a sign, and wraps a negative value around */
+	if( strchr(s, '-') != NULL ) {
+		return LPC4370SDR_ERROR_INVALID_PARAM;
+	}
 	s_end = s;
+	errno = 0;
 	u64_value = strtoull(s, &s_end, base);
-	if( (s != s_end) && (*s_end == 0) ) {
+	if( (s != s_end) && (*s_end == 0) && (errno == 0) ) {
 		*value = u64_value;
 		return LPC4370SDR_SUCCESS;
 	} else {
@@ -196,6 +202,11 @@ int main(int argc, char** argv) {
 		case 's':
 			serial_number = true;
 			result = parse_u64(optarg, &serial_number_val);
+			if( result != LPC4370SDR_SUCCESS ) {
+				printf("argument error: '-s %s' %s (%d)\n", optarg, lpc4370sdr_error_name(result), result);
+				usage();
+				return EXIT_FAILURE;
+			}
 			serial_number_msb_val = (uint32_t)(serial_number_val >> 32);
 			serial_number_lsb_val = (uint32_t)(serial_number_val & 0xFFFFFFFF);
 			printf("Board serial number to open: 0x%08X%08X\n", serial_number_msb_val, serial_number_lsb_val);

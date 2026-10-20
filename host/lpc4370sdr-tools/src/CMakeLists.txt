@@ -60,8 +60,11 @@ install(TARGETS lpc4370sdr_rx RUNTIME DESTINATION ${INSTALL_DEFAULT_BINDIR})
 add_executable(lpc4370sdr_debug lpc4370sdr_debug.c)
 install(TARGETS lpc4370sdr_debug RUNTIME DESTINATION ${INSTALL_DEFAULT_BINDIR})
 
+# POSIX only (unistd.h, usleep(), clock_gettime()): MinGW has them, MSVC does not
+if(NOT MSVC)
 add_executable(lpc4370sdr_extcheck lpc4370sdr_extcheck.c)
 install(TARGETS lpc4370sdr_extcheck RUNTIME DESTINATION ${INSTALL_DEFAULT_BINDIR})
+endif()
 
 if(NOT liblpc4370sdr_SOURCE_DIR)
 include_directories(${LIBLPC4370SDR_INCLUDE_DIR})
@@ -74,6 +77,9 @@ if(MSVC)
 LIST(APPEND TOOLS_LINK_LIBS libgetopt_static)
 endif()
 
+# lpc4370sdr_rx locks with pthreads outside Windows; lpc4370sdr_extcheck's clock_gettime() is in winpthreads on MinGW
+find_package(Threads)
+
 target_link_libraries(lpc4370sdr_gpio ${TOOLS_LINK_LIBS})
 target_link_libraries(lpc4370sdr_gpiodir ${TOOLS_LINK_LIBS})
 target_link_libraries(lpc4370sdr_lib_version ${TOOLS_LINK_LIBS})
@@ -82,6 +88,8 @@ target_link_libraries(lpc4370sdr_r820t ${TOOLS_LINK_LIBS})
 target_link_libraries(lpc4370sdr_spiflash ${TOOLS_LINK_LIBS})
 target_link_libraries(lpc4370sdr_calibrate ${TOOLS_LINK_LIBS})
 target_link_libraries(lpc4370sdr_info ${TOOLS_LINK_LIBS})
-target_link_libraries(lpc4370sdr_rx ${TOOLS_LINK_LIBS})
+target_link_libraries(lpc4370sdr_rx ${TOOLS_LINK_LIBS} ${CMAKE_THREAD_LIBS_INIT})
 target_link_libraries(lpc4370sdr_debug ${TOOLS_LINK_LIBS})
-target_link_libraries(lpc4370sdr_extcheck ${TOOLS_LINK_LIBS})
+if(NOT MSVC)
+target_link_libraries(lpc4370sdr_extcheck ${TOOLS_LINK_LIBS} ${CMAKE_THREAD_LIBS_INIT})
+endif()

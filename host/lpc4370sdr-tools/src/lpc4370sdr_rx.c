@@ -41,6 +41,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <io.h>
 
 #ifdef _MSC_VER
 
@@ -76,6 +77,10 @@ int gettimeofday(struct timeval *tv, void* ignored)
 #if defined(__GNUC__)
 #include <unistd.h>
 #include <sys/time.h>
+#endif
+
+#ifndef _WIN32
+#include <pthread.h>
 #endif
 
 #include <signal.h>
@@ -216,7 +221,6 @@ uint16_t wav_nb_bits_per_sample=16;
 lpc4370sdr_read_partid_serialno_t read_partid_serialno;
 
 volatile sig_atomic_t do_exit = 0;
-bool write_error = false; /* writing the samples failed: the stream stops, the exit status says so */
 
 FILE* fd = NULL;
 
@@ -228,9 +232,6 @@ struct timeval time_start;
 struct timeval t_start;
 
 bool got_first_packet = false;
-float average_rate = 0.0f;
-float global_average_rate = 0.0f;
-uint32_t rate_samples = 0;
 uint32_t buffer_count = 0;
 uint32_t sample_count = 0;
 	
@@ -239,7 +240,7 @@ uint32_t freq_hz;
 
 bool limit_num_samples = false;
 uint64_t samples_to_xfer = 0;
-uint64_t bytes_to_xfer = 0;
+uint64_t samples_left = 0; /* the sample callback's: samples_to_xfer still to write */
 
 bool call_set_packing = false;
 uint32_t packing_val = 0;
@@ -250,21 +251,52 @@ uint32_t gap_fill_val = 0;
 bool rf_port_given = false;
 uint32_t rf_port_val = 0;
 bool framing_given = false;
-lpc4370sdr_transfer_metadata_t frame_meta;
-uint32_t uart_bytes_total = 0;
 bool uart_baud_given = false;
 uint32_t uart_baud_val = 0;
 uint32_t print_uart_val = 0;
 bool sof_given = false;
 uint32_t sof_divider_val = 0;
-uint32_t sof_tags_total = 0;
 bool calibration_given = false;
 int32_t calibration_val = 0;
-uint64_t frame_gap_samples = 0;
-uint64_t frame_filled_samples = 0;
-uint64_t frame_gaps = 0;
-uint64_t frame_duplicate_chunks = 0;
-uint32_t frame_blocks = 0;
+
+/* What the sample callback tells the main thread, under stats_lock */
+typedef struct
+{
+	lpc4370sdr_transfer_metadata_t frame_meta; /* the last block's */
+	uint32_t frame_blocks;
+	uint64_t frame_gap_samples;
+	uint64_t frame_filled_samples;
+	uint64_t frame_gaps;
+	uint64_t frame_duplicate_chunks;
+	uint32_t uart_bytes_total;
+	uint32_t sof_tags_total;
+	float average_rate;
+	float global_average_rate;
+	uint32_t rate_samples;
+	bool limit_reached; /* the -n samples are written: the stream stops */
+	bool write_error; /* writing the samples failed: the stream stops, the exit status says so */
+} rx_stats_t;
+
+rx_stats_t stats;
+
+#ifdef _WIN32
+CRITICAL_SECTION stats_lock;
+#define stats_lock_init() InitializeCriticalSection(&stats_lock)
+#define stats_lock_take() EnterCriticalSection(&stats_lock)
+#define stats_lock_give() LeaveCriticalSection(&stats_lock)
+#else
+pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
+#define stats_lock_init()
+#define stats_lock_take() pthread_mutex_lock(&stats_lock)
+#define stats_lock_give() pthread_mutex_unlock(&stats_lock)
+#endif
+
+static void stats_get(rx_stats_t* s)
+{
+	stats_lock_take();
+	*s = stats;
+	stats_lock_give();
+}
 
 bool sample_rate = false;
 uint32_t sample_rate_val;
@@ -301,9 +333,14 @@ int parse_u64(char* s, uint64_t* const value) {
 		}
 	}
 
+	/* strtoull() takes a sign, and wraps a negative value around */
+	if( strchr(s, '-') != NULL ) {
+		return LPC4370SDR_ERROR_INVALID_PARAM;
+	}
 	s_end = s;
+	errno = 0;
 	u64_value = strtoull(s, &s_end, base);
-	if( (s != s_end) && (*s_end == 0) ) {
+	if( (s != s_end) && (*s_end == 0) && (errno == 0) ) {
 		*value = u64_value;
 		return LPC4370SDR_SUCCESS;
 	} else {
@@ -329,9 +366,14 @@ int parse_u32(char* s, uint32_t* const value)
 		}
 	}
 
+	/* strtoull() takes a sign, and wraps a negative value around */
+	if( strchr(s, '-') != NULL ) {
+		return LPC4370SDR_ERROR_INVALID_PARAM;
+	}
 	s_end = s;
+	errno = 0;
 	ulong_value = strtoull(s, &s_end, base);
-	if( (s != s_end) && (*s_end == 0) && ulong_value <= UINT32_MAX ) {
+	if( (s != s_end) && (*s_end == 0) && (errno == 0) && ulong_value <= UINT32_MAX ) {
 		*value = (uint32_t)ulong_value;
 		return LPC4370SDR_SUCCESS;
 	} else {
@@ -386,42 +428,69 @@ char* u64toa(uint64_t val, t_u64toa* str)
 	return res;
 }
 
+/*
+ * -n: the bytes of a block to write, its samples taken off samples_left. RAW in 12-bit packing
+ * (1 and 2) ends on a whole group of 8 values, the packing's three 32-bit words: up to 7 samples
+ * more. In packing 2 the first 2 values of every chunk, its counter and the ADC status, are no
+ * samples.
+ */
+static uint32_t limit_bytes(const lpc4370sdr_transfer_t* transfer, uint32_t chunks, uint32_t bytes)
+{
+	const uint32_t count = (uint32_t)transfer->sample_count;
+	const bool raw12 = sample_type_val == LPC4370SDR_SAMPLE_RAW && (packing_val == 1 || packing_val == 2);
+	uint32_t chunk_values = 0;
+	uint64_t samples = count;
+	uint64_t take, values;
+
+	if (sample_type_val == LPC4370SDR_SAMPLE_RAW && packing_val == 2)
+	{
+		/* Framed, the metadata counts the block's chunks; unframed chunks are LPC4370SDR_FRAME_WIRE_PACKED bytes */
+		chunk_values = chunks ? count / chunks : LPC4370SDR_FRAME_WIRE_PACKED / 3 * 2;
+		if (chunk_values > 2)
+			samples -= 2ull * (count / chunk_values);
+	}
+	if (samples <= samples_left)
+	{
+		samples_left -= samples;
+		return bytes;
+	}
+	take = samples_left;
+	samples_left = 0;
+	if (!raw12)
+		return (uint32_t)(take * (bytes / count));
+	values = take;
+	if (chunk_values > 2)
+		values = take / (chunk_values - 2) * chunk_values + ((take % (chunk_values - 2)) ? take % (chunk_values - 2) + 2 : 0);
+	values = (values + 7) / 8 * 8;
+	return (values / 8 * 12 < bytes) ? (uint32_t)(values / 8 * 12) : bytes;
+}
+
 int rx_callback(lpc4370sdr_transfer_t* transfer)
 {
 	uint32_t bytes_to_write;
 	void* pt_rx_buffer;
 	ssize_t bytes_written;
 	struct timeval time_now;
-	float time_difference, rate;
+	float time_difference, rate = 0.0f;
+	bool new_rate = false;
+	lpc4370sdr_transfer_metadata_t meta;
+	const bool have_meta = lpc4370sdr_transfer_get_metadata(transfer, &meta) == LPC4370SDR_SUCCESS;
+	bool failed, done;
 
+	if (have_meta)
 	{
-		lpc4370sdr_transfer_metadata_t meta;
-		if (lpc4370sdr_transfer_get_metadata(transfer, &meta) == LPC4370SDR_SUCCESS)
+		uint32_t i;
+		if (verbose)
 		{
-			uint32_t i;
-			frame_gap_samples += meta.gap_samples;
-			frame_filled_samples += meta.filled_samples;
-			frame_gaps += meta.gaps_len;
-			frame_duplicate_chunks += meta.duplicate_chunks;
-			frame_meta = meta;
-			sof_tags_total += meta.sof_tags_len;
-			if (verbose)
+			for (i = 0; i < meta.sof_tags_len; i++)
 			{
-				for (i = 0; i < meta.sof_tags_len; i++)
-				{
-					const lpc4370sdr_sof_tag_t* tag = &meta.sof_tags[i];
-					fprintf(stderr, "SOF %u: frame %u at sample %llu + %.4f\n",
-						tag->count, tag->frame, (unsigned long long)tag->sample_index, tag->fraction / 4294967296.0);
-				}
+				const lpc4370sdr_sof_tag_t* tag = &meta.sof_tags[i];
+				fprintf(stderr, "SOF %u: frame %u at sample %llu + %.4f\n",
+					tag->count, tag->frame, (unsigned long long)tag->sample_index, tag->fraction / 4294967296.0);
 			}
-			if (meta.uart_len)
-			{
-				uart_bytes_total += meta.uart_len;
-				if (print_uart_val)
-					fwrite(meta.uart_data, 1, meta.uart_len, stderr);
-			}
-			frame_blocks++;
 		}
+		if (meta.uart_len && print_uart_val)
+			fwrite(meta.uart_data, 1, meta.uart_len, stderr);
 	}
 
 	if( fd != NULL ) 
@@ -479,7 +548,6 @@ int rx_callback(lpc4370sdr_transfer_t* transfer)
 
 		if (!got_first_packet)
 		{
-			t_start = time_now;
 			time_start = time_now;
 			got_first_packet = true;
 		}
@@ -491,9 +559,7 @@ int rx_callback(lpc4370sdr_transfer_t* transfer)
 			{
 				time_difference = TimevalDiff(&time_now, &time_start);
 				rate = (float) sample_count / time_difference;
-				average_rate += 0.2f * (rate - average_rate);
-				global_average_rate += average_rate;
-				rate_samples++;
+				new_rate = true;
 				time_start = time_now;
 				sample_count = 0;
 				buffer_count = 0;
@@ -501,10 +567,7 @@ int rx_callback(lpc4370sdr_transfer_t* transfer)
 		}
 
 		if (limit_num_samples) {
-			if (bytes_to_write >= bytes_to_xfer) {
-				bytes_to_write = (int)bytes_to_xfer;
-			}
-			bytes_to_xfer -= bytes_to_write;
+			bytes_to_write = limit_bytes(transfer, have_meta ? meta.chunks : 0, bytes_to_write);
 		}
 
 		if(pt_rx_buffer != NULL)
@@ -514,26 +577,46 @@ int rx_callback(lpc4370sdr_transfer_t* transfer)
 		{
 			bytes_written = 0;
 		}
-		if (bytes_written != (ssize_t)bytes_to_write)
-		{
-			write_error = true;
-			return -1;
-		}
-		if ((limit_num_samples == true) && (bytes_to_xfer == 0))
-			return -1;
-		else
-			return 0;
+		failed = bytes_written != (ssize_t)bytes_to_write;
+		done = limit_num_samples && samples_left == 0;
 	}else
 	{
-		return -1;
+		failed = false;
+		done = true;
 	}
+
+	stats_lock_take();
+	if (have_meta)
+	{
+		stats.frame_gap_samples += meta.gap_samples;
+		stats.frame_filled_samples += meta.filled_samples;
+		stats.frame_gaps += meta.gaps_len;
+		stats.frame_duplicate_chunks += meta.duplicate_chunks;
+		stats.frame_meta = meta;
+		stats.sof_tags_total += meta.sof_tags_len;
+		stats.uart_bytes_total += meta.uart_len;
+		stats.frame_blocks++;
+	}
+	if (new_rate)
+	{
+		stats.average_rate += 0.2f * (rate - stats.average_rate);
+		stats.global_average_rate += stats.average_rate;
+		stats.rate_samples++;
+	}
+	if (failed)
+		stats.write_error = true;
+	else if (done && limit_num_samples)
+		stats.limit_reached = true;
+	stats_lock_give();
+
+	return (failed || done) ? -1 : 0;
 }
 
 static void usage(void)
 {
 	fprintf(stderr, "lpc4370sdr_rx v%s\n", LPC4370SDR_RX_VERSION);
 	fprintf(stderr, "Usage:\n");
-	fprintf(stderr, "-r <filename>: Receive data into file\n");
+	fprintf(stderr, "-r <filename>: Receive data into file, - = stdout\n");
 	fprintf(stderr, "-w Receive data into file with WAV header and automatic name\n");
 	fprintf(stderr, " This is for SDR# compatibility and may not work with other software\n");
 	fprintf(stderr, "[-s serial_number_64bits]: Open device with specified 64bits serial number\n");
@@ -546,32 +629,48 @@ static void usage(void)
 	fprintf(stderr, "[-W watchdog]: 1=feed the device watchdog every second and show its state, 0=disabled(default)\n");
 	fprintf(stderr, "[-S sof_divider]: Tag the USB Start-Of-Frame of every frame (1 ms) whose number is a multiple of this\n");
 	fprintf(stderr, "\twith its sample index, 0=off(default); -d prints every tag\n");
-	fprintf(stderr, " 1=enabled(12bits packed), 0=disabled(default 16bits not packed)\n");
+	fprintf(stderr, "[-B baud]: Set the baud rate of the device's auxiliary UART (its bytes come with the framed chunks)\n");
+	fprintf(stderr, "[-N print_uart]: 1=copy the auxiliary UART bytes to stderr, 0=only count them(default)\n");
+	fprintf(stderr, "[-C ppb]: Crystal correction in ppb for this session (the board's stored one: lpc4370sdr_calibrate)\n");
 	fprintf(stderr, "[-f frequency_MHz]: Set frequency in MHz between [%lu, %lu] (default %luMHz)\n",
 		FREQ_HZ_MIN / FREQ_ONE_MHZ, FREQ_HZ_MAX / FREQ_ONE_MHZ, DEFAULT_FREQ_HZ / FREQ_ONE_MHZ);
-	fprintf(stderr, "[-a sample_rate]: Set sample rate\n");
+	fprintf(stderr, "[-a sample_rate]: Set sample rate in samples per second of the sample type (real types: the ADC rate),\n");
+	fprintf(stderr, "\tor up to 1000000 an index into the list of rates lpc4370sdr_info shows (default 0)\n");
 	fprintf(stderr, "[-t sample_type]: Set sample type, \n");
 	fprintf(stderr, " 0=FLOAT32_IQ, 1=FLOAT32_REAL, 2=INT16_IQ(default), 3=INT16_REAL, 4=U16_REAL, 5=RAW\n");
 	fprintf(stderr, "[-b biast]: Set Bias Tee, 1=enabled, 0=disabled(default)\n");
 	fprintf(stderr, "[-P rf_port]: HydraSDR RFOne antenna input, 0=ANT(default), 1=CABLE1, 2=CABLE2\n");
-	fprintf(stderr, "[-v vga_gain]: Set VGA/IF gain, 0-%d (default %d)\n", VGA_GAIN_MAX, vga_gain);
-	fprintf(stderr, "[-m mixer_gain]: Set Mixer gain, 0-%d (default %d)\n", MIXER_GAIN_MAX, mixer_gain);
-	fprintf(stderr, "[-l lna_gain]: Set LNA gain, 0-%d (default %d)\n", LNA_GAIN_MAX, lna_gain);
+	fprintf(stderr, "[-v vga_gain]: Set VGA/IF gain, 0-%d (default %d)\n", VGA_GAIN_MAX, DEFAULT_VGA_IF_GAIN);
+	fprintf(stderr, "[-m mixer_gain]: Set Mixer gain, 0-%d (default %d)\n", MIXER_GAIN_MAX, DEFAULT_MIXER_GAIN);
+	fprintf(stderr, "[-l lna_gain]: Set LNA gain, 0-%d (default %d)\n", LNA_GAIN_MAX, DEFAULT_LNA_GAIN);
 	fprintf(stderr, "[-g linearity_gain]: Set linearity simplified gain, 0-%d\n", LINEARITY_GAIN_MAX);
 	fprintf(stderr, "[-h sensivity_gain]: Set sensitivity simplified gain, 0-%d\n", SENSITIVITY_GAIN_MAX);
-	fprintf(stderr, "[-n num_samples]: Number of samples to transfer (default is unlimited)\n");
+	fprintf(stderr, "[-n num_samples]: Number of samples to transfer (default is unlimited): IQ samples with the IQ types;\n");
+	fprintf(stderr, "\tRAW: ADC samples (packing 2: not its counter and status values), in 12-bit packing up to the end\n");
+	fprintf(stderr, "\tof their group of 8 values (12 bytes)\n");
 	fprintf(stderr, "[-d]: Verbose mode\n");
 }
 
 struct lpc4370sdr_device* device = NULL;
 
-#ifdef _MSC_VER
+#ifdef _WIN32
 BOOL WINAPI
-sighandler(int signum)
+sighandler(DWORD signum)
 {
-	if (CTRL_C_EVENT == signum) {
-		fprintf(stderr, "Caught signal %d\n", signum);
+	switch (signum) {
+	case CTRL_C_EVENT:
+	case CTRL_BREAK_EVENT:
+		fprintf(stderr, "Caught signal %u\n", (unsigned)signum);
 		do_exit = true;
+		return TRUE;
+
+	case CTRL_CLOSE_EVENT:
+	case CTRL_LOGOFF_EVENT:
+	case CTRL_SHUTDOWN_EVENT:
+		/* Windows ends the process when this returns (or after 5 s): main stops the stream,
+		   finishes the file and exits meanwhile */
+		do_exit = true;
+		Sleep(5000);
 		return TRUE;
 	}
 	return FALSE;
@@ -603,7 +702,8 @@ int main(int argc, char** argv)
 	float time_diff;
 	int64_t file_pos;
 	int exit_code = EXIT_SUCCESS;
-	bool limit_reached;
+	bool started;
+	rx_stats_t st;
 
 	uint32_t count;
 	uint32_t packing_val_u32;
@@ -725,11 +825,12 @@ int main(int argc, char** argv)
 				{
 					char* end;
 					freq = true;
-					freq_hz_temp = strtod(optarg, &end) * (double)FREQ_ONE_MHZ;
+					/* Rounded: 32.001 MHz is 32000999.99... Hz in a double */
+					freq_hz_temp = strtod(optarg, &end) * (double)FREQ_ONE_MHZ + 0.5;
 					if (end == optarg || *end != 0)
 						result = LPC4370SDR_ERROR_INVALID_PARAM;
 				}
-				if(freq_hz_temp >= 0 && freq_hz_temp <= (double)FREQ_HZ_MAX)
+				if(freq_hz_temp >= 0 && freq_hz_temp < (double)FREQ_HZ_MAX + 1.0)
 					freq_hz = (uint32_t)freq_hz_temp;
 				else
 					freq_hz = UINT_MAX;
@@ -850,12 +951,6 @@ int main(int argc, char** argv)
 		sample_rate_val = sample_rate_u32;
 	}
 
-	/* Raw samples: as many bits as the packing gives them */
-	if (sample_type_val == LPC4370SDR_SAMPLE_RAW)
-		bytes_to_xfer = samples_to_xfer * (packing_val == 3 ? 8 : (packing_val == 1 || packing_val == 2) ? 12 : 16) / 8;
-	else
-		bytes_to_xfer = samples_to_xfer * wav_nb_bits_per_sample * wav_nb_channels / 8;
-
 	if (samples_to_xfer >= SAMPLES_TO_XFER_MAX_U64) {
 		fprintf(stderr, "argument error: num_samples must be less than %s/%sMio\n",
 				u64toa(SAMPLES_TO_XFER_MAX_U64, &ascii_u64_data1),
@@ -865,9 +960,9 @@ int main(int argc, char** argv)
 	}
 
 	if( freq ) {
-		if( (freq_hz >= FREQ_HZ_MAX) || (freq_hz < FREQ_HZ_MIN) )
+		if( (freq_hz > FREQ_HZ_MAX) || (freq_hz < FREQ_HZ_MIN) )
 		{
-			fprintf(stderr, "argument error: frequency_MHz=%.6f MHz and shall be between [%lu, %lu[ MHz\n",
+			fprintf(stderr, "argument error: frequency_MHz=%.6f MHz and shall be between [%lu, %lu] MHz\n",
 							((double)freq_hz/(double)FREQ_ONE_MHZ), FREQ_HZ_MIN/FREQ_ONE_MHZ, FREQ_HZ_MAX/FREQ_ONE_MHZ);
 			usage();
 			return EXIT_FAILURE;
@@ -889,7 +984,7 @@ int main(int argc, char** argv)
 		}
 
 		time (&rawtime);
-		timeinfo = localtime (&rawtime);
+		timeinfo = gmtime (&rawtime);
 		receiver_mode = RECEIVER_MODE_RX;
 		/* File format lpc4370sdr Year(2013), Month(11), Day(28), Hour Min Sec+Z, Freq kHz, IQ.wav */
 		strftime(date_time, DATE_TIME_MAX_LEN, "%Y%m%d_%H%M%S", timeinfo);
@@ -1054,18 +1149,9 @@ int main(int argc, char** argv)
 	}
 	else
 	{
-		uint32_t i;
+		/* The library takes the rate in the sample type's terms: real samples at the ADC rate, the
+		   doubled rates lpc4370sdr_get_samplerates() lists for them */
 		wav_sample_per_sec = sample_rate_val;
-		/* The library takes a rate from the list by its IQ value: with real samples that is half
-		   the rate the list gives, and the device then runs at the listed rate */
-		if (wav_nb_channels == 1)
-		{
-			for (i = 0; i < count; i++)
-			{
-				if ((uint64_t)supported_samplerates[i] == 2ull * sample_rate_val)
-					wav_sample_per_sec = supported_samplerates[i];
-			}
-		}
 	}
 
 	free(supported_samplerates);
@@ -1166,7 +1252,13 @@ int main(int argc, char** argv)
 	}
 
 	if (!strcmp(path,"-"))
+	{
 		fd = stdout;
+#ifdef _WIN32
+		/* Text mode would turn every 0x0A byte into 0x0D 0x0A */
+		_setmode(_fileno(stdout), _O_BINARY);
+#endif
+	}
 	else
 		fd = fopen(path, "wb");
 	if( fd == NULL ) {
@@ -1179,6 +1271,7 @@ int main(int argc, char** argv)
 	result = setvbuf(fd , NULL , _IOFBF , FD_BUFFER_SIZE);
 	if( result != 0 ) {
 		fprintf(stderr, "setvbuf() failed: %d\n", result);
+		fclose(fd);
 		lpc4370sdr_close(device);
 		lpc4370sdr_exit();
 		return EXIT_FAILURE;
@@ -1197,11 +1290,14 @@ int main(int argc, char** argv)
 		}
 	}
 	
-#ifdef _MSC_VER
-	SetConsoleCtrlHandler( (PHANDLER_ROUTINE) sighandler, TRUE );
+#ifdef _WIN32
+	SetConsoleCtrlHandler(sighandler, TRUE);
 #else
 	signal(SIGINT, &sigint_callback_handler);
 	signal(SIGTERM, &sigint_callback_handler);
+	signal(SIGHUP, &sigint_callback_handler);
+	/* A closed pipe (| head) fails the write instead: the stream stops, the file is closed */
+	signal(SIGPIPE, SIG_IGN);
 #endif
 
 	if( (linearity_gain == false) && (sensitivity_gain == false) )
@@ -1239,35 +1335,37 @@ int main(int argc, char** argv)
 		}
 	}
 
+	stats_lock_init();
+	stats.average_rate = (float) wav_sample_per_sec;
+	samples_left = samples_to_xfer;
+	gettimeofday(&t_start, NULL);
+
 	result = lpc4370sdr_start_rx(device, rx_callback, NULL);
 	if( result != LPC4370SDR_SUCCESS ) {
 		fprintf(stderr, "lpc4370sdr_start_rx() failed: %s (%d)\n", lpc4370sdr_error_name(result), result);
-		lpc4370sdr_close(device);
-		lpc4370sdr_exit();
-		return EXIT_FAILURE;
+	} else {
+		result = lpc4370sdr_set_freq(device, freq_hz);
+		if( result != LPC4370SDR_SUCCESS ) {
+			fprintf(stderr, "lpc4370sdr_set_freq() failed: %s (%d)\n", lpc4370sdr_error_name(result), result);
+		}
+	}
+	/* Not started: the stream is stopped and the file finished all the same, below */
+	started = result == LPC4370SDR_SUCCESS;
+
+	if (started)
+	{
+		fprintf(stderr, "Stop with Ctrl-C\n");
+		sleep(1);
 	}
 
-	result = lpc4370sdr_set_freq(device, freq_hz);
-	if( result != LPC4370SDR_SUCCESS ) {
-		fprintf(stderr, "lpc4370sdr_set_freq() failed: %s (%d)\n", lpc4370sdr_error_name(result), result);
-		lpc4370sdr_close(device);
-		lpc4370sdr_exit();
-		return EXIT_FAILURE;
-	}
-
-	fprintf(stderr, "Stop with Ctrl-C\n");
-
-	average_rate = (float) wav_sample_per_sec;
-
-	sleep(1);
-
-	while( (lpc4370sdr_is_streaming(device) == LPC4370SDR_TRUE) &&
+	while( started && (lpc4370sdr_is_streaming(device) == LPC4370SDR_TRUE) &&
 		(do_exit == false) )
 	{
 		lpc4370sdr_stream_status_t stream_status;
-		float average_rate_now = average_rate * 1e-6f;
+		float average_rate_now;
+		stats_get(&st);
+		average_rate_now = st.average_rate * 1e-6f;
 		sprintf(str, "%2.3f", average_rate_now);
-		average_rate_now = 9.5f;
 		fprintf(stderr, "Streaming at %5s MSPS\n", str);
 		if (lpc4370sdr_get_stream_status(device, &stream_status) == LPC4370SDR_SUCCESS)
 		{
@@ -1289,52 +1387,56 @@ int main(int argc, char** argv)
 					fprintf(stderr, "Watchdog: not built into this firmware\n");
 			}
 		}
-		if (frame_blocks)
+		if (st.frame_blocks)
 		{
+			const lpc4370sdr_transfer_metadata_t* frame_meta = &st.frame_meta;
 			fprintf(stderr, "Frames: sample index %llu, gap samples %llu, duplicate chunks %llu, sync errors %u, chunks per block %u, freq %u Hz\n",
-				(unsigned long long)frame_meta.sample_index, (unsigned long long)frame_gap_samples,
-				(unsigned long long)frame_duplicate_chunks, frame_meta.sync_errors, frame_meta.chunks, frame_meta.freq_hz);
+				(unsigned long long)frame_meta->sample_index, (unsigned long long)st.frame_gap_samples,
+				(unsigned long long)st.frame_duplicate_chunks, frame_meta->sync_errors, frame_meta->chunks, frame_meta->freq_hz);
 			fprintf(stderr, "Gaps: %llu, %llu samples filled, %llu left out\n",
-				(unsigned long long)frame_gaps, (unsigned long long)frame_filled_samples,
-				(unsigned long long)(frame_gap_samples - frame_filled_samples));
+				(unsigned long long)st.frame_gaps, (unsigned long long)st.frame_filled_samples,
+				(unsigned long long)(st.frame_gap_samples - st.frame_filled_samples));
 			fprintf(stderr, "Chunks: %u lost by the device, %u overwritten (%u dropped here by their tail marker), %u missing on the way, %u resyncs\n",
-				frame_meta.lost_chunks, frame_meta.overrun_chunks, frame_meta.corrupt_chunks, frame_meta.unaccounted_chunks, frame_meta.resyncs);
+				frame_meta->lost_chunks, frame_meta->overrun_chunks, frame_meta->corrupt_chunks, frame_meta->unaccounted_chunks, frame_meta->resyncs);
 			if (packing_val == 2)
-				fprintf(stderr, "ADC status bits of the last block: 0x%03x\n", frame_meta.adc_status);
-			if (frame_meta.pps_count)
+				fprintf(stderr, "ADC status bits of the last block: 0x%03x\n", frame_meta->adc_status);
+			if (frame_meta->pps_count)
 			{
 				fprintf(stderr, "PPS: %u edges, last at sample %llu + %.4f (%.6f s before this block), uart bytes %u\n",
-					frame_meta.pps_count, (unsigned long long)frame_meta.pps_sample_index,
-					frame_meta.pps_fraction / 4294967296.0,
-					(double)(int64_t)(frame_meta.sample_index - frame_meta.pps_sample_index) / ((double)wav_sample_per_sec * (wav_nb_channels == 1 ? 1.0 : 2.0)),
-					uart_bytes_total);
+					frame_meta->pps_count, (unsigned long long)frame_meta->pps_sample_index,
+					frame_meta->pps_fraction / 4294967296.0,
+					(double)(int64_t)(frame_meta->sample_index - frame_meta->pps_sample_index) / ((double)wav_sample_per_sec * (wav_nb_channels == 1 ? 1.0 : 2.0)),
+					st.uart_bytes_total);
 			}
-			if (frame_meta.sof_count)
+			if (frame_meta->sof_count)
 			{
 				fprintf(stderr, "SOF: %u tagged, %u received, last: frame %u at sample %llu + %.4f (%.6f s before this block)\n",
-					frame_meta.sof_count, sof_tags_total, frame_meta.sof_frame,
-					(unsigned long long)frame_meta.sof_sample_index, frame_meta.sof_fraction / 4294967296.0,
-					(double)(int64_t)(frame_meta.sample_index - frame_meta.sof_sample_index) / ((double)wav_sample_per_sec * (wav_nb_channels == 1 ? 1.0 : 2.0)));
+					frame_meta->sof_count, st.sof_tags_total, frame_meta->sof_frame,
+					(unsigned long long)frame_meta->sof_sample_index, frame_meta->sof_fraction / 4294967296.0,
+					(double)(int64_t)(frame_meta->sample_index - frame_meta->sof_sample_index) / ((double)wav_sample_per_sec * (wav_nb_channels == 1 ? 1.0 : 2.0)));
 			}
 		}
-		if ((limit_num_samples == true) && (bytes_to_xfer == 0))
+		if (st.limit_reached)
 			do_exit = true;
 		else
 			sleep(1);
 	}
 	
-	result = lpc4370sdr_is_streaming(device);	
-	limit_reached = (limit_num_samples == true) && (bytes_to_xfer == 0);
-	if (write_error)
+	stats_get(&st);
+	if (!started)
+	{
+		exit_code = EXIT_FAILURE;
+	}
+	else if (st.write_error)
 	{
 		fprintf(stderr, "\nWriting to %s failed, exiting...\n", path);
 		exit_code = EXIT_FAILURE;
 	}
-	else if (do_exit && !limit_reached)
+	else if (do_exit && !st.limit_reached)
 	{
 		fprintf(stderr, "\nUser cancel, exiting...\n");
 	}
-	else if (!limit_reached)
+	else if (!st.limit_reached)
 	{
 		/* The stream ended by itself: USB or the device failed */
 		fprintf(stderr, "\nThe stream stopped, exiting...\n");
@@ -1346,9 +1448,9 @@ int main(int argc, char** argv)
 	gettimeofday(&t_end, NULL);
 	time_diff = TimevalDiff(&t_end, &t_start);
 	fprintf(stderr, "Total time: %5.4f s\n", time_diff);
-	if (rate_samples > 0)
+	if (st.rate_samples > 0)
 	{
-		fprintf(stderr, "Average speed %2.4f MSPS %s\n", (global_average_rate * 1e-6f / rate_samples), (wav_nb_channels == 2 ? "IQ" : "Real"));
+		fprintf(stderr, "Average speed %2.4f MSPS %s\n", (st.global_average_rate * 1e-6f / st.rate_samples), (wav_nb_channels == 2 ? "IQ" : "Real"));
 	}
 	
 	if(device != NULL)
@@ -1399,7 +1501,7 @@ int main(int argc, char** argv)
 				exit_code = EXIT_FAILURE;
 			}
 		}	
-		if (fclose(fd) != 0)
+		if (fclose(fd) != 0 && !st.write_error)
 		{
 			fprintf(stderr, "Failed to write %s\n", path);
 			exit_code = EXIT_FAILURE;

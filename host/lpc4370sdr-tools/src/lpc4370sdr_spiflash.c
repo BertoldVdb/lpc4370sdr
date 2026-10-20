@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <getopt.h>
 #include <sys/types.h>
@@ -48,8 +49,14 @@
 /* 8 Mbit flash */
 #define MAX_LENGTH 0x100000
 /* The device's erase command (LPC4370SDR_SPIFLASH_ERASE) erases the first 64 KB sector only: a
-   write must stay inside it, flash that was not erased would end up with old AND new bits */
+   write must stay inside it, flash that was not erased would end up with old AND new bits. The
+   sector is read first and written back whole, with the file at its address. The calibration
+   (0x20000, lpc4370sdr_calibrate) lies outside it */
 #define WRITE_MAX_END 0x10000
+/* Tries of the first write after the erase, each up to the library's 500 ms control timeout */
+#define ERASE_WAIT_TRIES 8
+/* Where a failed write leaves what the sector was to hold */
+#define SECTOR_SAVE_PATH "lpc4370sdr_spiflash_sector0.bin"
 
 static struct option long_options[] = {
 	{ "address", required_argument, 0, 'a' },
@@ -78,10 +85,15 @@ int parse_u32(char* s, uint32_t* const value)
 		}
 	}
 
+	/* strtoull() takes a sign, and wraps a negative value around */
+	if (strchr(s, '-') != NULL) {
+		return LPC4370SDR_ERROR_INVALID_PARAM;
+	}
 	s_end = s;
+	errno = 0;
 	u64_value = strtoull(s, &s_end, base);
 	u32_value = (uint32_t)u64_value;
-	if ((s != s_end) && (*s_end == 0) && u64_value <= UINT32_MAX) {
+	if ((s != s_end) && (*s_end == 0) && (errno == 0) && u64_value <= UINT32_MAX) {
 		*value = u32_value;
 		return LPC4370SDR_SUCCESS;
 	} else {
@@ -106,13 +118,32 @@ int parse_u64(char* s, uint64_t* const value) {
 		}
 	}
 
+	/* strtoull() takes a sign, and wraps a negative value around */
+	if( strchr(s, '-') != NULL ) {
+		return LPC4370SDR_ERROR_INVALID_PARAM;
+	}
 	s_end = s;
+	errno = 0;
 	u64_value = strtoull(s, &s_end, base);
-	if( (s != s_end) && (*s_end == 0) ) {
+	if( (s != s_end) && (*s_end == 0) && (errno == 0) ) {
 		*value = u64_value;
 		return LPC4370SDR_SUCCESS;
 	} else {
 		return LPC4370SDR_ERROR_INVALID_PARAM;
+	}
+}
+
+/* The sector is erased but not (all) written: keep what it was to hold, to write it with -w */
+static void save_sector(const uint8_t* sector)
+{
+	FILE* f = fopen(SECTOR_SAVE_PATH, "wb");
+	if (f != NULL && fwrite(sector, 1, WRITE_MAX_END, f) == WRITE_MAX_END && fclose(f) == 0) {
+		fprintf(stderr, "The 1st 64KB of the flash may be erased: what they were to hold is in %s, write it with -w %s\n",
+			SECTOR_SAVE_PATH, SECTOR_SAVE_PATH);
+	} else {
+		if (f != NULL)
+			fclose(f);
+		fprintf(stderr, "The 1st 64KB of the flash may be erased, and saving what they were to hold to %s failed\n", SECTOR_SAVE_PATH);
 	}
 }
 
@@ -122,7 +153,8 @@ static void usage()
 	printf("\t-a, --address <n>: starting address (default: 0)\n");
 	printf("\t-l, --length <n>: number of bytes to read (default: 0)\n");
 	printf("\t-r <filename>: Read data into file (SPIFI@0x80000000).\n");
-	printf("\t-w <filename>: Write data from file (the first 64 KB of the flash only: the device erases that sector), then verify it.\n");
+	printf("\t-w <filename>: Write data from file at the address, in the first 64 KB of the flash only (the sector the device erases:\n");
+	printf("\t\tthe rest of it is read and written back), then verify the sector.\n");
 	printf("\t[-s serial_number_64bits]: Open board with specified 64bits serial number.\n");
 }
 
@@ -172,6 +204,9 @@ int main(int argc, char** argv)
 		case 's':
 			serial_number = true;
 			result = parse_u64(optarg, &serial_number_val);
+			if (result != LPC4370SDR_SUCCESS) {
+				break;
+			}
 			serial_number_msb_val = (uint32_t)(serial_number_val >> 32);
 			serial_number_lsb_val = (uint32_t)(serial_number_val & 0xFFFFFFFF);
 			printf("Board serial number to open: 0x%08X%08X\n", serial_number_msb_val, serial_number_lsb_val);
@@ -325,52 +360,69 @@ int main(int argc, char** argv)
 		}
 	} else
 	{
-		/* Write Firmware */
-		static uint8_t check[MAX_LENGTH];
-		const uint32_t start = address, total = length;
+		/* Write Firmware: the whole sector, the file merged into what the flash holds */
+		const uint32_t start = address;
+		static uint8_t sector[WRITE_MAX_END];
+		static uint8_t check[WRITE_MAX_END];
 		ssize_t bytes_read = fread(data, 1, length, fd);
 		if (bytes_read != (ssize_t)length) {
 			fprintf(stderr, "Failed read file (read %d bytes).\n", (int)bytes_read);
 			fclose(fd);
 			return EXIT_FAILURE;
 		}
-		printf("Erasing 1st 64KB in SPI flash.\n");
-		result = lpc4370sdr_spiflash_erase(device);
-		if (result != LPC4370SDR_SUCCESS) {
-			fprintf(stderr, "lpc4370sdr_spiflash_erase() failed: %s (%d)\n", lpc4370sdr_error_name(result), result);
-			fclose(fd);
-			return EXIT_FAILURE;
-		}
-		while (length)
+		printf("Reading the 1st 64KB in SPI flash (the sector the device erases).\n");
+		for (address = 0; address < WRITE_MAX_END; address += 256)
 		{
-			xfer_len = (length > 256) ? 256 : length;
-			printf("Writing %d bytes at 0x%06x.\n", xfer_len, address);
-			result = lpc4370sdr_spiflash_write(device, address, xfer_len, pdata);
-			if (result != LPC4370SDR_SUCCESS) {
-				fprintf(stderr, "lpc4370sdr_spiflash_write() failed: %s (%d)\n", lpc4370sdr_error_name(result), result);
-				fclose(fd);
-				return EXIT_FAILURE;
-			}
-			address += xfer_len;
-			pdata += xfer_len;
-			length -= xfer_len;
-		}
-		/* Read it back */
-		printf("Verifying %u bytes at 0x%06x.\n", total, start);
-		for (address = start, pdata = check; address < start + total; address += xfer_len, pdata += xfer_len)
-		{
-			xfer_len = (start + total - address > 256) ? 256 : (uint16_t)(start + total - address);
-			result = lpc4370sdr_spiflash_read(device, address, xfer_len, pdata);
+			result = lpc4370sdr_spiflash_read(device, address, 256, &sector[address]);
 			if (result != LPC4370SDR_SUCCESS) {
 				fprintf(stderr, "lpc4370sdr_spiflash_read() failed: %s (%d)\n", lpc4370sdr_error_name(result), result);
 				fclose(fd);
 				return EXIT_FAILURE;
 			}
 		}
-		if (memcmp(check, data, total) != 0) {
+		memcpy(&sector[start], data, length);
+		printf("Erasing 1st 64KB in SPI flash.\n");
+		result = lpc4370sdr_spiflash_erase(device);
+		if (result != LPC4370SDR_SUCCESS) {
+			fprintf(stderr, "lpc4370sdr_spiflash_erase() failed: %s (%d)\n", lpc4370sdr_error_name(result), result);
+			save_sector(sector);
+			fclose(fd);
+			return EXIT_FAILURE;
+		}
+		printf("Writing 64KB (the file's %u bytes at 0x%06x).\n", length, start);
+		for (address = 0; address < WRITE_MAX_END; address += 256)
+		{
+			/* The device acknowledges the erase before the flash has done it (typically 150 ms,
+			   1 s and more at worst): the first write waits for it and may time out. Writing a
+			   page again with the same data does no harm */
+			int tries = (address == 0) ? ERASE_WAIT_TRIES : 1;
+			do {
+				result = lpc4370sdr_spiflash_write(device, address, 256, &sector[address]);
+			} while (result != LPC4370SDR_SUCCESS && --tries > 0);
+			if (result != LPC4370SDR_SUCCESS) {
+				fprintf(stderr, "lpc4370sdr_spiflash_write() at 0x%06x failed: %s (%d)\n", address, lpc4370sdr_error_name(result), result);
+				save_sector(sector);
+				fclose(fd);
+				return EXIT_FAILURE;
+			}
+		}
+		/* Read it back */
+		printf("Verifying 64KB.\n");
+		for (address = 0; address < WRITE_MAX_END; address += 256)
+		{
+			result = lpc4370sdr_spiflash_read(device, address, 256, &check[address]);
+			if (result != LPC4370SDR_SUCCESS) {
+				fprintf(stderr, "lpc4370sdr_spiflash_read() failed: %s (%d)\n", lpc4370sdr_error_name(result), result);
+				save_sector(sector);
+				fclose(fd);
+				return EXIT_FAILURE;
+			}
+		}
+		if (memcmp(check, sector, WRITE_MAX_END) != 0) {
 			uint32_t i;
-			for (i = 0; i < total && check[i] == data[i]; i++);
-			fprintf(stderr, "Verify failed: the flash differs from the file at 0x%06x.\n", start + i);
+			for (i = 0; i < WRITE_MAX_END && check[i] == sector[i]; i++);
+			fprintf(stderr, "Verify failed: the flash differs from what was written at 0x%06x.\n", i);
+			save_sector(sector);
 			fclose(fd);
 			return EXIT_FAILURE;
 		}

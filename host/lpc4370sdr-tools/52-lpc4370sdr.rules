@@ -1,4 +1,4 @@
 # lpc4370sdr boards: Airspy R2 and Mini, and the HydraSDR RFOne (Airspy USB ID with lpc4370sdr firmware)
-ATTR{idVendor}=="1d50", ATTR{idProduct}=="60a1", SYMLINK+="lpc4370sdr-%k", MODE="660", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="60a1", SYMLINK+="lpc4370sdr-%k", MODE="660", GROUP="plugdev", TAG+="uaccess"
 # HydraSDR RFOne with its own firmware
-ATTR{idVendor}=="38af", ATTR{idProduct}=="0001", SYMLINK+="lpc4370sdr-%k", MODE="660", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTR{idVendor}=="38af", ATTR{idProduct}=="0001", SYMLINK+="lpc4370sdr-%k", MODE="660", GROUP="plugdev", TAG+="uaccess"
