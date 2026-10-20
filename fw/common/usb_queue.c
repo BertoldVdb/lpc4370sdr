@@ -86,8 +86,6 @@ static usb_transfer_t* allocate_transfer(
 */
   usb_transfer_t* transfer;
 
-  if (queue->free_transfers == NULL)
-          return NULL;
 /*
   do {
           transfer = (void *) __ldrex((uint32_t *) &queue->free_transfers);
@@ -96,8 +94,11 @@ static usb_transfer_t* allocate_transfer(
 */
   uint32_t irq = irq_lock();
   transfer = queue->free_transfers;
-  queue->free_transfers = transfer->next;
-  transfer->next = NULL;
+  if (transfer != NULL)
+  {
+    queue->free_transfers = transfer->next;
+    transfer->next = NULL;
+  }
   irq_unlock(irq);
 
   return transfer;

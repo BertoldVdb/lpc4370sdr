@@ -29,6 +29,8 @@
 
 void ADCHS_start(uint8_t conf_num);
 void ADCHS_stop(uint8_t conf_num);
+void ADCHS_continue(void);
+void ADCHS_tuner_standby(void); /* main loop: ADCHS_stop() left it to a deferred job */
 
 void set_samplerate_m4(uint8_t conf_num);
 void set_packing_m4(uint8_t state);
@@ -45,6 +47,13 @@ typedef enum
 
 extern board_type_t board_type;
 #define BOARD_IS_AIRSPY() (board_type != BOARD_HYDRASDR_RFONE)
+
+/* Interrupt priorities, 0 is the highest. The M0 implements bits [7:6] only: four levels. The
+   watchdog warning (0x00, common/watchdog.c) preempts all of them, so a long USB request does
+   not keep the watchdog from being fed; the UART preempts USB so no byte waits for a request */
+#define M0_IRQ_PRIORITY_UART   (0x40)
+#define M0_IRQ_PRIORITY_M4CORE (0x80)
+#define M0_IRQ_PRIORITY_USB    (0xC0)
 
 /* Ring buffer state shared with the M4 */
 extern volatile lpc4370sdr_stream_state_t * const stream;

@@ -21,10 +21,11 @@
  */
 
 /*
- * Free-running timers clocked from the same PLL as the ADC capture the
- * events. The count at the ADC trigger is the origin of the sample index,
- * so an event's sample index is its tick count times the sample rate over
- * the timer clock. Two events exist:
+ * Free-running timers capture the events. They run on PLL1 and the ADC on
+ * PLL0AUDIO, IDIVB or GP_CLKIN itself, all from the same reference
+ * (GP_CLKIN), so the two keep a fixed ratio. The count at the ADC trigger
+ * is the origin of the sample index, so an event's sample index is its tick
+ * count times the sample rate over the timer clock. Two events exist:
  *  - PPS: a rising edge on the board's PPS pin,
  *  - SOF: the USB0 controller's Start-Of-Frame pulse, which the GIMA can
  *    only feed to T3_CAP2. The RFOne/R2 PPS pin P2_2 is T3_CAP2 as well, so
@@ -97,8 +98,9 @@ static uint32_t sof_frame_base; /* extends the controller's 11-bit frame number 
 
 static volatile lpc4370sdr_stream_state_t* const stream = LPC4370SDR_STREAM_STATE;
 
-/* Timer 3 count minus Timer 0 count at the same instant, measured at every stream start. Both run
- * from the same clock and are never reset, so it is a constant; kept for debugging (mem read). */
+/* Timer 3 count minus Timer 0 count at the same instant, measured at every stream start: it derives
+ * Timer 0's anchor from Timer 3's. Both run from the same clock and are never reset, so it is a
+ * constant (a global, for reading it with the debug requests). */
 volatile int32_t timing_timer3_minus_timer0;
 volatile uint32_t timing_offset_span; /* ticks the best measurement took, its uncertainty */
 #ifdef LPC4370SDR_TIMING_DEBUG
@@ -210,6 +212,10 @@ void timing_init(void)
   pps = LPC4370SDR_HW_MINI_PINS(lpc4370sdr_conf->conf_hw.hardware_type) ? &pps_mini : &pps_p2_2;
   /* the UART ISR (M0) stamps its bytes on the timer the PPS edges are captured on */
   stream->uart_timer_tc = (uint32_t)&TIMER_TC(pps->timer->base);
+  /* RAM is not cleared at boot; the M0, which writes them, starts later */
+  stream->uart_seq = 0;
+  stream->uart_in = 0;
+  stream->uart_tick = 0;
 
   armed = 0;
   sof_divider = 0;
@@ -326,9 +332,9 @@ static void ticks_to_sample(uint64_t ticks, uint64_t* index, uint32_t* fraction)
 {
   uint64_t q = ticks / ratio_den;
   uint32_t r = (uint32_t)(ticks % ratio_den);
-  uint32_t rn = r * ratio_num;
+  uint64_t rn = (uint64_t)r * ratio_num; /* passes 2^32 for some pairs of rates */
   *index = q * ratio_num + rn / ratio_den;
-  *fraction = (uint32_t)((((uint64_t)(rn % ratio_den)) << 32) / ratio_den);
+  *fraction = (uint32_t)(((rn % ratio_den) << 32) / ratio_den);
 }
 
 /*
@@ -353,7 +359,10 @@ static void pps_uart(uint64_t count, uint32_t* in, uint32_t* quiet_us)
 
   /* the timer wraps every 2^32 ticks: a line quiet for over 2^31 counts as busy, never quiet */
   ticks = (int32_t)((uint32_t)count - tick);
-  if(ticks <= 0 || tries == 0 || timer_hz == 0)
+  if(*in == 0 && tries)
+  {
+    *quiet_us = 0xFFFF; /* nothing received since boot */
+  } else if(ticks <= 0 || tries == 0 || timer_hz == 0)
   {
     *quiet_us = 0;
   } else

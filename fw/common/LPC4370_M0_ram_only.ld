@@ -42,15 +42,17 @@ MEMORY
 	ram_ahb2_usb (rwx) : ORIGIN = 0x2000C000, LENGTH =  16K
 }
 
-cm4_data_share = ORIGIN(ram_ahb1_m4_share);	/* M4 data shared (write by M4 read by M0 */
-adchs_data     = ORIGIN(ram_ahb1_adchs);	/* M4 ADCHS data (write by ADCHS DMA or M4) */
-cm0_data_share = ORIGIN(ram_ahb1_m0_share);	/* M0 data shared (write by M0 read by M4) */
+cm4_data_share = ORIGIN(ram_ahb1_m4_share);	/* Stream state and debug mailbox (lpc4370sdr_stream.h, lpc4370sdr_debug.h), written by both cores */
+cm0_data_share = ORIGIN(ram_ahb1_m0_share);	/* M0 commands to the M4 (written by M0, acknowledged by M4) */
 
 cm0_exec_baseaddr = ORIGIN(ram_ahb2);	/* Used by M4 to load code from M4 RAM to M0 final exec/run addr */
 cm0s_exec_baseaddr = ORIGIN(ram_local_m0sub);	/* Used by M4 to load code from M4 RAM to M0Sub final exec/run addr */
 
 conf_data_share = ORIGIN(ram_ahb1_spare);	/* M4/M0 conf data shared */
 conf_data_share_size = LENGTH(ram_ahb1_spare);	/* M4/M0 conf data shared size */
+
+/* The ADC ring's regions */
+INCLUDE lpc4370sdr_stream.ld
 
 /* Include the common ld script. */
 INCLUDE libopencm3_lpc43xx_m0.ld

@@ -509,14 +509,31 @@ static int r82x_set_tf(r82x_priv_t *priv, uint32_t freq)
 	return rc;
 }
 
-int r82x_set_pll(r82x_priv_t *priv, uint32_t freq)
+/* The PLL divider that puts the VCO in range for this LO, -1 when there is none */
+static int r82x_pll_div(uint32_t freq, uint32_t *vco)
 {
 	const uint32_t vco_min = 1770000000;
 	const uint32_t vco_max = 3900000000;
+	uint32_t div_num;
+
+	for (div_num = 0; div_num <= 5; div_num++)
+	{
+		uint64_t v = (uint64_t)freq << (div_num + 1); /* 32 bits would wrap above 2^31 Hz */
+		if (v >= vco_min && v <= vco_max)
+		{
+			*vco = (uint32_t)v;
+			return div_num;
+		}
+	}
+	return -1;
+}
+
+int r82x_set_pll(r82x_priv_t *priv, uint32_t freq)
+{
 	uint32_t ref = priv->xtal_freq >> 1;
 
 	int rc;
-	uint32_t div_num;
+	int div_num;
 	uint32_t vco = 0;
 	uint32_t rem;
 	uint32_t mask;
@@ -524,22 +541,10 @@ int r82x_set_pll(r82x_priv_t *priv, uint32_t freq)
 	uint8_t nint;
 	uint8_t ni;
 	uint8_t si;
-	uint8_t div_found;
 
 	/* Find a suitable divider */
-	div_found = 0;
-	for (div_num = 0; div_num <= 5; div_num++)
-	{
-		uint64_t v = (uint64_t)freq << (div_num + 1); /* 32 bits would wrap above 2^31 Hz */
-		if (v >= vco_min && v <= vco_max)
-		{
-			vco = (uint32_t)v;
-			div_found = 1;
-			break;
-		}
-	}
-
-	if (!div_found)
+	div_num = r82x_pll_div(freq, &vco);
+	if (div_num < 0)
 		return -1;
 
 	vco += ref >> 16;
@@ -604,10 +609,15 @@ int r82x_set_freq(r82x_priv_t *priv, uint64_t freq)
 {
 	int rc;
 	uint32_t lo_freq;
+	uint32_t vco;
 
 	if(freq > 0xFFFFFFFFULL - priv->if_freq)
 		return -1;
 	lo_freq = (uint32_t)freq + priv->if_freq;
+
+	/* An LO the PLL cannot reach leaves the tuner as it is, tracking filter included */
+	if (r82x_pll_div(lo_freq, &vco) < 0)
+		return -1;
 
 	rc = r82x_set_tf(priv, freq);
 	if (rc < 0)

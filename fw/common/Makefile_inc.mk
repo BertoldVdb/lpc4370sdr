@@ -29,7 +29,7 @@
 
 LPC4370SDR_OPTS = -DLPC43XX -DLPC43XX_M4 -DCORE_M4
 
-LDSCRIPT ?= ../common/LPC4370_M4.ld
+LDSCRIPT ?= ../common/LPC4370_M4_rom_to_ram.ld
 
 LIBOPENCM3 ?= ../libopencm3
 
@@ -55,15 +55,34 @@ LDFLAGS += -mcpu=cortex-m4 -mthumb -DTHUMB -mfloat-abi=hard -mfpu=fpv4-sp-d16 \
 		-Wl,--gc-sections -Xlinker -Map=$(BINARY).map
 OBJ += $(SRC:.c=.o)
 
+# The build options, the same for every core (see Makefile_M0_inc.mk)
+NOFLASH ?= 0
+WATCHDOG ?= 0
+DEBUG_REQUESTS ?= 1
+ifeq ($(WATCHDOG),1)
+CFLAGS += -DLPC4370SDR_HOST_WATCHDOG=1
+endif
 # make NOFLASH=1: board without the SPI flash
 ifeq ($(NOFLASH),1)
 CFLAGS += -DLPC4370SDR_NO_FLASH=1
 endif
+# make DEBUG_REQUESTS=0: no MEM_WRITE and CALL requests (the M4 runs no CALL either)
+ifeq ($(DEBUG_REQUESTS),0)
+CFLAGS += -DLPC4370SDR_NO_DEBUG_REQUESTS
+endif
 # The build options in effect: .opts changes (and every object rebuilds) when they do. A file
 # that always exists, since .SECONDARY would let a missing stamp go unnoticed.
-BUILD_OPTS := f$(NOFLASH)_x$(EXTRA_CFLAGS)
+BUILD_OPTS := w$(WATCHDOG)_f$(NOFLASH)_d$(DEBUG_REQUESTS)_x$(EXTRA_CFLAGS)
 # make EXTRA_CFLAGS=...: test builds, e.g. -DLPC4370SDR_STREAM_COUNTER_START=0xFFFFF000u
 CFLAGS += $(EXTRA_CFLAGS)
+# The M0 image linked in must have been built with the same options: refuse to mix them
+ifneq ($(M0_OPTS),)
+ifeq ($(filter clean,$(MAKECMDGOALS)),)
+ifneq ($(file < $(M0_OPTS)),$(BUILD_OPTS))
+$(error build options $(BUILD_OPTS) differ from the M0 image's ($(file < $(M0_OPTS))), from $(M0_OPTS): give make and make -C fw_bin the same options)
+endif
+endif
+endif
 OPTS_STAMP = .opts
 ifneq ($(file < .opts),$(BUILD_OPTS))
 $(file > .opts,$(BUILD_OPTS))
@@ -93,10 +112,11 @@ program: $(BINARY).dfu
 %.images: %.bin %.hex %.srec %.list
 	@#echo "*** $* images generated ***"
 
-# LPC43xx ROM DFU image: 16-byte boot header
+# LPC43xx ROM DFU image: 16-byte boot header (UM10503 Table 23): no AES and no hash (0xDA), the
+# image size in 512-byte frames
 %.dfu: %.bin
 	$(Q)rm -f _header.bin
-	$(Q)python -c "import os,struct,sys; d=struct.pack('<BBH8sI',0x1a,0x3f,(os.path.getsize('$(*).bin')+511)//512,b'',0xffffffff); getattr(sys.stdout,'buffer',sys.stdout).write(d)" > _header.bin
+	$(Q)python3 -c "import os,struct,sys; d=struct.pack('<BBH8sI',0xda,0x3f,(os.path.getsize('$(*).bin')+511)//512,b'',0xffffffff); sys.stdout.buffer.write(d)" > _header.bin
 	$(Q)cat _header.bin $(*).bin >$(*).dfu
 	$(Q)rm -f _header.bin
 

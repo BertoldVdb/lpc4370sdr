@@ -52,12 +52,13 @@ typedef union
   uint8_t id_8b[8]; /* 8*8bits 64bits Unique ID */
 } w25q80bv_unique_id_t;
 
-void w25q80bv_setup(void);
-void w25q80bv_chip_erase(void);
-void w25q80bv_sector_erase(const uint32_t addr); /* 1 Sector=64KB */
-void w25q80bv_program(uint32_t addr, uint32_t len, const uint8_t* data);
+/* These return 0, or -1 when the flash is not there, is not one of the above, or stays busy */
+int w25q80bv_setup(void);
+int w25q80bv_chip_erase(void);
+int w25q80bv_sector_erase(const uint32_t addr); /* 1 Sector=64KB */
+int w25q80bv_program(uint32_t addr, uint32_t len, const uint8_t* data);
 uint8_t w25q80bv_get_device_id(void);
-void w25q80bv_get_unique_id(w25q80bv_unique_id_t* unique_id);
-void w25q80bv_read(uint32_t addr, uint32_t len, uint8_t* const data);
+int w25q80bv_get_unique_id(w25q80bv_unique_id_t* unique_id);
+int w25q80bv_read(uint32_t addr, uint32_t len, uint8_t* const data);
 
 #endif//__W25Q80BV_H__

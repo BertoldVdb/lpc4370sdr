@@ -26,7 +26,6 @@
 #include "usb_type.h"
 
 extern usb_endpoint_t usb_endpoint_bulk_in;
-extern usb_endpoint_t usb_endpoint_bulk_out;
 extern usb_endpoint_t usb_endpoint_control_in;
 extern usb_endpoint_t usb_endpoint_control_out;
 extern usb_device_t usb_device;
@@ -52,7 +51,8 @@ typedef enum
   DEFERRED_LNA_AGC,
   DEFERRED_MIXER_AGC,
   DEFERRED_SET_RF_PORT,
-  DEFERRED_RETUNE
+  DEFERRED_RETUNE,
+  DEFERRED_TUNER_STANDBY /* queued by deferred_tuner_standby() */
 } deferred_kind_t;
 
 typedef struct
@@ -67,6 +67,8 @@ typedef struct
 
 extern deferred_job_t deferred_job;
 void deferred_job_run(void); /* main loop */
+/* The receiver went off while a job was pending: ADCHS_tuner_standby() runs after the job */
+void deferred_tuner_standby(void);
 
 void usb_req_init(void);
 

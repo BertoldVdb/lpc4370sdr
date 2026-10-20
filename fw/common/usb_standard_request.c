@@ -22,6 +22,7 @@
  */
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
 #include "usb_standard_request.h"
 
@@ -43,9 +44,11 @@ static uint_fast8_t usb_endpoint_number(const uint_fast8_t endpoint_address)
   return (endpoint_address & 0xF);
 }
 
-const uint8_t* usb_endpoint_descriptor(const usb_endpoint_t* const endpoint)
+static const uint8_t* usb_endpoint_descriptor_from_address(
+  const usb_device_t* const device,
+  const uint_fast16_t endpoint_address)
 {
-  const usb_configuration_t* const configuration = endpoint->device->configuration;
+  const usb_configuration_t* const configuration = device->configuration;
   if( configuration )
   {
     const uint8_t* descriptor = configuration->descriptor;
@@ -53,7 +56,7 @@ const uint8_t* usb_endpoint_descriptor(const usb_endpoint_t* const endpoint)
     {
       if( descriptor[1] == USB_DESCRIPTOR_TYPE_ENDPOINT )
       {
-        if( descriptor[2] == endpoint->address ) {
+        if( descriptor[2] == endpoint_address ) {
           return descriptor;
         }
       }
@@ -62,6 +65,25 @@ const uint8_t* usb_endpoint_descriptor(const usb_endpoint_t* const endpoint)
   }
 
   return 0;
+}
+
+const uint8_t* usb_endpoint_descriptor(const usb_endpoint_t* const endpoint)
+{
+  return usb_endpoint_descriptor_from_address(endpoint->device, endpoint->address);
+}
+
+/* The endpoint a request's wIndex names exists: endpoint 0, or one of the configuration's */
+static bool usb_endpoint_address_valid(const usb_endpoint_t* const endpoint)
+{
+  const uint_fast16_t endpoint_address = endpoint->setup.index;
+  return (endpoint_address & ~0x80) == 0
+      || usb_endpoint_descriptor_from_address(endpoint->device, endpoint_address) != 0;
+}
+
+/* Interface requests: the configuration's only interface, 0 */
+static bool usb_interface_valid(const usb_endpoint_t* const endpoint)
+{
+  return endpoint->device->configuration && endpoint->setup.index == 0;
 }
 
 uint_fast16_t usb_endpoint_descriptor_max_packet_size(const uint8_t* const endpoint_descriptor)
@@ -127,7 +149,6 @@ static usb_request_status_t usb_send_descriptor(
   usb_endpoint_t* const endpoint,
   const uint8_t* const descriptor_data)
 {
-  const uint32_t setup_length = endpoint->setup.length;
   uint32_t descriptor_length = descriptor_data[0];
   if ( ( descriptor_data[1] == USB_DESCRIPTOR_TYPE_CONFIGURATION ) ||
         ( descriptor_data[1] == USB_DESCRIPTOR_TYPE_OTHER_SPEED_CONFIGURATION ) )
@@ -135,11 +156,8 @@ static usb_request_status_t usb_send_descriptor(
     descriptor_length = (descriptor_data[3] << 8) | descriptor_data[2];
   }
   // We cast the const away but this shouldn't be a problem as this is a write transfer
-  usb_transfer_schedule_block(
-    endpoint->in,
-    (uint8_t* const) descriptor_data,
-    (setup_length > descriptor_length) ? descriptor_length : setup_length);
-  usb_transfer_schedule_ack(endpoint->out);
+  // (clamped to wLength, with the ZLP a shorter descriptor that ends on a packet needs)
+  usb_control_reply(endpoint, (uint8_t* const) descriptor_data, descriptor_length);
   return USB_REQUEST_STATUS_OK;
 }
 
@@ -163,10 +181,14 @@ static usb_request_status_t usb_send_descriptor_string(usb_endpoint_t* const end
   return USB_REQUEST_STATUS_STALL;
 }
 
+/* OTHER_SPEED_CONFIGURATION: the other speed's configuration descriptor with its own type */
+static uint8_t usb_other_speed_descriptor[64];
+
 static usb_request_status_t usb_send_descriptor_config(
   usb_endpoint_t* const endpoint,
   usb_speed_t speed,
-  const uint8_t config_num)
+  const uint8_t config_num,
+  const usb_descriptor_type_t type)
 {
   usb_configuration_t** config = *(endpoint->device->configurations);
   unsigned int i = 0;
@@ -176,7 +198,17 @@ static usb_request_status_t usb_send_descriptor_config(
     {
       if (i == config_num)
       {
-        return usb_send_descriptor(endpoint, (*config)->descriptor);
+        const uint8_t* descriptor = (*config)->descriptor;
+        if( type == USB_DESCRIPTOR_TYPE_OTHER_SPEED_CONFIGURATION )
+        {
+          const uint32_t length = (descriptor[3] << 8) | descriptor[2];
+          if( length > sizeof(usb_other_speed_descriptor) )
+            return USB_REQUEST_STATUS_STALL;
+          memcpy(usb_other_speed_descriptor, descriptor, length);
+          usb_other_speed_descriptor[1] = USB_DESCRIPTOR_TYPE_OTHER_SPEED_CONFIGURATION;
+          descriptor = usb_other_speed_descriptor;
+        }
+        return usb_send_descriptor(endpoint, descriptor);
       } else {
         i++;
       }
@@ -196,9 +228,9 @@ static usb_request_status_t usb_standard_request_get_descriptor_setup(
     case USB_DESCRIPTOR_TYPE_CONFIGURATION:
       // TODO: Duplicated code. Refactor.
       if( usb_speed(endpoint->device) == USB_SPEED_HIGH ) {
-        return usb_send_descriptor_config(endpoint, USB_SPEED_HIGH, endpoint->setup.value_l);
+        return usb_send_descriptor_config(endpoint, USB_SPEED_HIGH, endpoint->setup.value_l, USB_DESCRIPTOR_TYPE_CONFIGURATION);
       } else {
-        return usb_send_descriptor_config(endpoint, USB_SPEED_FULL, endpoint->setup.value_l);
+        return usb_send_descriptor_config(endpoint, USB_SPEED_FULL, endpoint->setup.value_l, USB_DESCRIPTOR_TYPE_CONFIGURATION);
       }
 
     case USB_DESCRIPTOR_TYPE_DEVICE_QUALIFIER:
@@ -207,9 +239,9 @@ static usb_request_status_t usb_standard_request_get_descriptor_setup(
     case USB_DESCRIPTOR_TYPE_OTHER_SPEED_CONFIGURATION:
       // TODO: Duplicated code. Refactor.
       if( usb_speed(endpoint->device) == USB_SPEED_HIGH ) {
-        return usb_send_descriptor_config(endpoint, USB_SPEED_FULL, endpoint->setup.value_l);
+        return usb_send_descriptor_config(endpoint, USB_SPEED_FULL, endpoint->setup.value_l, USB_DESCRIPTOR_TYPE_OTHER_SPEED_CONFIGURATION);
       } else {
-        return usb_send_descriptor_config(endpoint, USB_SPEED_HIGH, endpoint->setup.value_l);
+        return usb_send_descriptor_config(endpoint, USB_SPEED_HIGH, endpoint->setup.value_l, USB_DESCRIPTOR_TYPE_OTHER_SPEED_CONFIGURATION);
       }
 
     case USB_DESCRIPTOR_TYPE_STRING:
@@ -278,13 +310,9 @@ static usb_request_status_t usb_standard_request_set_configuration_setup(
   usb_endpoint_t* const endpoint)
 {
   const uint8_t usb_configuration = endpoint->setup.value_l;
+  /* Configuration 0 returns to the Address state: the device keeps its address (USB 2.0 9.4.7) */
   if( usb_set_configuration(endpoint->device, usb_configuration) )
   {
-    if( usb_configuration == 0 )
-    {
-      // TODO: Should this be done immediately?
-      usb_set_address_immediate(endpoint->device, 0);
-    }
     usb_transfer_schedule_ack(endpoint->in);
     return USB_REQUEST_STATUS_OK;
   }
@@ -352,9 +380,12 @@ static usb_request_status_t usb_standard_request_get_configuration(
 static usb_request_status_t usb_standard_request_get_status_endpoint(usb_endpoint_t* const endpoint)
 {
   const uint_fast8_t endpoint_number = usb_endpoint_number(endpoint->setup.index);
-  USB_EpStatus = (USB0_ENDPTCTRL(endpoint_number) & (USB0_ENDPTCTRL_RXS | USB0_ENDPTCTRL_TXS)) ? 1 : 0;
-  usb_transfer_schedule_block(endpoint->in, &USB_EpStatus, 2);
-  usb_transfer_schedule_ack(endpoint->out);
+  if( !usb_endpoint_address_valid(endpoint) )
+    return USB_REQUEST_STATUS_STALL;
+  /* The halt of the direction addressed */
+  USB_EpStatus = (USB0_ENDPTCTRL(endpoint_number)
+                  & ((endpoint->setup.index & 0x80) ? USB0_ENDPTCTRL_TXS : USB0_ENDPTCTRL_RXS)) ? 1 : 0;
+  usb_control_reply(endpoint, &USB_EpStatus, 2);
   return USB_REQUEST_STATUS_OK;
 }
 static usb_request_status_t usb_standard_request_get_status(
@@ -366,19 +397,20 @@ static usb_request_status_t usb_standard_request_get_status(
     switch (endpoint->setup.request_type & USB_SETUP_REQUEST_TYPE_RECIPIENT_mask)
     {
       case USB_SETUP_REQUEST_TYPE_RECIPIENT_DEVICE:
-        usb_transfer_schedule_block(endpoint->in, &USB_DeviceStatus, 2);
-        usb_transfer_schedule_ack(endpoint->out);
+        usb_control_reply(endpoint, &USB_DeviceStatus, 2);
         return USB_REQUEST_STATUS_OK;
         break;
       case USB_SETUP_REQUEST_TYPE_RECIPIENT_INTERFACE:
-        usb_transfer_schedule_block(endpoint->in, &USB_InterfaceStatus, 2);
-        usb_transfer_schedule_ack(endpoint->out);
+        if( !usb_interface_valid(endpoint) )
+          return USB_REQUEST_STATUS_STALL;
+        usb_control_reply(endpoint, &USB_InterfaceStatus, 2);
         return USB_REQUEST_STATUS_OK;
         break;
       case USB_SETUP_REQUEST_TYPE_RECIPIENT_ENDPOINT:
         return usb_standard_request_get_status_endpoint(endpoint);
         break;
     }
+    return USB_REQUEST_STATUS_STALL;
   }
   return USB_REQUEST_STATUS_OK;
 }
@@ -391,18 +423,14 @@ static usb_request_status_t usb_standard_request_get_interface(
   {
     switch (endpoint->setup.request_type & USB_SETUP_REQUEST_TYPE_RECIPIENT_mask)
     {
-      case USB_SETUP_REQUEST_TYPE_RECIPIENT_DEVICE:
-        break;
-
       case USB_SETUP_REQUEST_TYPE_RECIPIENT_INTERFACE:
-        usb_transfer_schedule_block(endpoint->in, &USB_CurrentInterface, 1);
-        usb_transfer_schedule_ack(endpoint->out);
+        if( !usb_interface_valid(endpoint) )
+          return USB_REQUEST_STATUS_STALL;
+        usb_control_reply(endpoint, &USB_CurrentInterface, 1);
         return USB_REQUEST_STATUS_OK;
         break;
-
-      case USB_SETUP_REQUEST_TYPE_RECIPIENT_ENDPOINT:
-        break;
     }
+    return USB_REQUEST_STATUS_STALL;
   }
   return USB_REQUEST_STATUS_OK;
 }
@@ -416,29 +444,41 @@ static usb_request_status_t usb_standard_request_set_interface(
   {
     switch (endpoint->setup.request_type & USB_SETUP_REQUEST_TYPE_RECIPIENT_mask)
     {
-      case USB_SETUP_REQUEST_TYPE_RECIPIENT_DEVICE:
-        break;
       case USB_SETUP_REQUEST_TYPE_RECIPIENT_INTERFACE:
+        /* Alternate setting 0 is the only one */
+        if( !usb_interface_valid(endpoint) || endpoint->setup.value != 0 )
+          return USB_REQUEST_STATUS_STALL;
         usb_transfer_schedule_ack(endpoint->in);
         return USB_REQUEST_STATUS_OK;
-      case USB_SETUP_REQUEST_TYPE_RECIPIENT_ENDPOINT:
-        break;
     }
+    return USB_REQUEST_STATUS_STALL;
   }
   return USB_REQUEST_STATUS_OK;
 }
 
-static usb_request_status_t usb_standard_request_clear_feature_endpoint(
-  usb_endpoint_t* const endpoint)
+/* ENDPOINT_HALT is the only feature: no remote wakeup, no test modes. Endpoint 0 takes it and
+   ignores it, its stall ends with the next SETUP anyway. */
+static usb_request_status_t usb_standard_request_feature_endpoint(
+  usb_endpoint_t* const endpoint,
+  const bool set)
 {
   const uint_fast8_t endpoint_number = usb_endpoint_number(endpoint->setup.index);
-  USB0_ENDPTCTRL(endpoint_number) &= ~(USB0_ENDPTCTRL_RXS | USB0_ENDPTCTRL_TXS);
-  /* ClearFeature(ENDPOINT_HALT) also resets the endpoint's data toggle to DATA0 (USB 2.0 9.4.5),
-     as the host does on its side: otherwise the host drops the next packet half of the time */
-  if(endpoint->setup.index & 0x80) /* IN endpoint address */
-    USB0_ENDPTCTRL(endpoint_number) |= USB0_ENDPTCTRL_TXR;
-  else
-    USB0_ENDPTCTRL(endpoint_number) |= USB0_ENDPTCTRL_RXR;
+  if( endpoint->setup.value != USB_FEATURE_ENDPOINT_HALT || !usb_endpoint_address_valid(endpoint) )
+    return USB_REQUEST_STATUS_STALL;
+  if( endpoint_number != 0 )
+  {
+    /* Only the direction addressed. ClearFeature(ENDPOINT_HALT) also resets the endpoint's data
+       toggle to DATA0 (USB 2.0 9.4.5), as the host does on its side: otherwise the host drops the
+       next packet half of the time */
+    if( endpoint->setup.index & 0x80 ) /* IN endpoint address */
+      USB0_ENDPTCTRL(endpoint_number) = set
+        ? (USB0_ENDPTCTRL(endpoint_number) | USB0_ENDPTCTRL_TXS)
+        : ((USB0_ENDPTCTRL(endpoint_number) & ~USB0_ENDPTCTRL_TXS) | USB0_ENDPTCTRL_TXR);
+    else
+      USB0_ENDPTCTRL(endpoint_number) = set
+        ? (USB0_ENDPTCTRL(endpoint_number) | USB0_ENDPTCTRL_RXS)
+        : ((USB0_ENDPTCTRL(endpoint_number) & ~USB0_ENDPTCTRL_RXS) | USB0_ENDPTCTRL_RXR);
+  }
   usb_transfer_schedule_ack(endpoint->in);
   return USB_REQUEST_STATUS_OK;
 }
@@ -451,24 +491,12 @@ static usb_request_status_t usb_standard_request_clear_feature(
   {
     switch (endpoint->setup.request_type & USB_SETUP_REQUEST_TYPE_RECIPIENT_mask)
     {
-      case USB_SETUP_REQUEST_TYPE_RECIPIENT_DEVICE:
-        break;
-      case USB_SETUP_REQUEST_TYPE_RECIPIENT_INTERFACE:
-        break;
       case USB_SETUP_REQUEST_TYPE_RECIPIENT_ENDPOINT:
-        return usb_standard_request_clear_feature_endpoint(endpoint);
+        return usb_standard_request_feature_endpoint(endpoint, false);
         break;
     }
+    return USB_REQUEST_STATUS_STALL;
   }
-  return USB_REQUEST_STATUS_OK;
-}
-
-static usb_request_status_t usb_standard_request_set_feature_endpoint(
-  usb_endpoint_t* const endpoint)
-{
-  const uint_fast8_t endpoint_number = usb_endpoint_number(endpoint->setup.index);
-  USB0_ENDPTCTRL(endpoint_number) |= (USB0_ENDPTCTRL_RXS | USB0_ENDPTCTRL_TXS);
-  usb_transfer_schedule_ack(endpoint->in);
   return USB_REQUEST_STATUS_OK;
 }
 
@@ -480,14 +508,11 @@ static usb_request_status_t usb_standard_request_set_feature(
   {
     switch (endpoint->setup.request_type & USB_SETUP_REQUEST_TYPE_RECIPIENT_mask)
     {
-      case USB_SETUP_REQUEST_TYPE_RECIPIENT_DEVICE:
-        break;
-      case USB_SETUP_REQUEST_TYPE_RECIPIENT_INTERFACE:
-        break;
       case USB_SETUP_REQUEST_TYPE_RECIPIENT_ENDPOINT:
-        return usb_standard_request_set_feature_endpoint(endpoint);
+        return usb_standard_request_feature_endpoint(endpoint, true);
         break;
     }
+    return USB_REQUEST_STATUS_STALL;
   }
   return USB_REQUEST_STATUS_OK;
 }

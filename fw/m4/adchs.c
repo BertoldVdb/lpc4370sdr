@@ -167,6 +167,28 @@ void ADCHS_DMA_init(uint8_t packed, uint32_t header_bytes)
   LPC_GPDMA->CONFIG = 0x01; /* Enable DMA channels, little endian */
 }
 
+/* The channel's linked-list register holds the item after the one in progress */
+uint32_t ADCHS_DMA_lli_in_progress(void)
+{
+  uint32_t next = (LPC_GPDMA->C0LLI - (uint32_t)&adchs_dma_lli[0]) / sizeof(t_gpdma_lli);
+  return (next + ADCHS_DMA_NUM_LLI - 1) % ADCHS_DMA_NUM_LLI;
+}
+
+/* A bus error disables the channel: restart it with the first item of the chunk after the one it
+   was filling, so that a slot that keeps failing cannot hold the DMA interrupt */
+void ADCHS_DMA_restart(uint32_t chunk_slots)
+{
+  uint32_t i = ((ADCHS_DMA_lli_in_progress() / chunk_slots + 1) * chunk_slots) % ADCHS_DMA_NUM_LLI;
+
+  if(LPC_GPDMA->C0CONFIG & 0x1)
+    return;
+  LPC_GPDMA->C0SRCADDR = adchs_dma_lli[i].src_addr;
+  LPC_GPDMA->C0DESTADDR = adchs_dma_lli[i].dst_addr;
+  LPC_GPDMA->C0CONTROL = adchs_dma_lli[i].control;
+  LPC_GPDMA->C0LLI = adchs_dma_lli[i].next_lli;
+  LPC_GPDMA->C0CONFIG |= 0x1;
+}
+
 void ADCHS_init_stop(void)
 {
   /* Reset ADCHS using RGU */

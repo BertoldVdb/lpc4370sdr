@@ -358,7 +358,7 @@ uint32_t sys_calib_r82x(uint32_t xtal_freq, int32_t correction_ppb)
 }
 
 /*
-Configure PLL1 to min speed (48MHz) => see cpu_clock_pll1_low_speed() .
+Configure PLL1 to its low speed (40 or 72MHz) => see cpu_clock_pll1_low_speed() .
 Configure PLL0USB @480MHz for USB0.
 Note: PLL1 clock is used by M4/M0 core, Peripheral, APB1, APB3.
 */
@@ -587,7 +587,7 @@ void sys_clock_init(void)
   /* Switch off the oscillator */
   CGU_XTAL_OSC_CTRL = CGU_XTAL_OSC_CTRL_ENABLE;
 
-  CGU_BASE_SAFE_CLK = CGU_BASE_USB1_CLK_PD;
+  // CGU_BASE_SAFE_CLK (IRC) is the watchdog's: always on, read-only
   // CGU_BASE_USB0_CLK is used for USB0 HS
   // CGU_BASE_M0_CLK is used
   /* Switch off USB1 clock */
@@ -670,28 +670,16 @@ void sys_clock_init(void)
 }
 
 /*
- Configure PLL1 to low speed with CGU_SRC_GP_CLKIN.
- Connect PLL1 to M4/M0 core, Peripheral, APB1, APB3.
- Init I2C0 & I2C1.
-This function is mainly used to lower power consumption.
+ PLL1 from CGU_SRC_GP_CLKIN in non-integer mode (FBSEL=0, DIRECT=0):
+    FCCO = M*(FCLKIN/N), 156 to 320 MHz (UM10503 12.7.6)
+    FCLKOUT = FCCO/(2*P)
+ with MSEL = M-1, NSEL = N-1 and PSEL = 0, 1, 2, 3 for P = 1, 2, 4, 8. The post-divider is outside
+ the loop: changing P alone keeps the lock.
 */
-void cpu_clock_pll1_low_speed(const core_clock_pll1_ls_t* const pt_cpu_clock_pll1_ls_conf)
+static void pll1_setup(uint32_t pll1_psel, uint32_t pll1_nsel, uint32_t pll1_msel)
 {
   uint32_t pll_reg;
 
-  uint32_t pll1_psel;
-  uint32_t pll1_nsel;
-  uint32_t pll1_msel;
-
-  pll1_psel = pt_cpu_clock_pll1_ls_conf->pll1_ls_psel;
-  pll1_nsel = pt_cpu_clock_pll1_ls_conf->pll1_ls_nsel;
-  pll1_msel = pt_cpu_clock_pll1_ls_conf->pll1_ls_msel;
-
-  /* Configure PLL1 Clock */
-  /* Integer mode:
-    FCLKOUT = M*(FCLKIN/N)
-    FCCO = 2*P*FCLKOUT = 2*P*M*(FCLKIN/N)
-  */
   pll_reg = CGU_PLL1_CTRL;
   /* Clear PLL1 bits */
   pll_reg &= ~( CGU_PLL1_CTRL_CLK_SEL_MASK | CGU_PLL1_CTRL_PD | CGU_PLL1_CTRL_FBSEL |  /* CLK SEL, PowerDown , FBSEL */
@@ -702,24 +690,45 @@ void cpu_clock_pll1_low_speed(const core_clock_pll1_ls_t* const pt_cpu_clock_pll
   pll_reg |= CGU_PLL1_CTRL_CLK_SEL(CGU_SRC_GP_CLKIN)
         | CGU_PLL1_CTRL_PSEL(pll1_psel)
         | CGU_PLL1_CTRL_NSEL(pll1_nsel)
-        | CGU_PLL1_CTRL_MSEL(pll1_msel)
-        | CGU_PLL1_CTRL_FBSEL
-        | CGU_PLL1_CTRL_DIRECT;
+        | CGU_PLL1_CTRL_MSEL(pll1_msel);
   CGU_PLL1_CTRL = pll_reg;
   /* wait until stable */
   while (!(CGU_PLL1_STAT & CGU_PLL1_STAT_LOCK));
+}
 
+/* The base clocks that run from PLL1: M4/M0 core, Peripheral, APB1, APB3 */
+static void pll1_base_clocks(uint32_t clk_src)
+{
+  CGU_BASE_M4_CLK = (CGU_BASE_M4_CLK_CLK_SEL(clk_src) | CGU_BASE_M4_CLK_AUTOBLOCK);
+  CGU_BASE_PERIPH_CLK = CGU_BASE_PERIPH_CLK_AUTOBLOCK
+      | CGU_BASE_PERIPH_CLK_CLK_SEL(clk_src);
+  CGU_BASE_APB1_CLK = CGU_BASE_APB1_CLK_AUTOBLOCK
+      | CGU_BASE_APB1_CLK_CLK_SEL(clk_src);
+  CGU_BASE_APB3_CLK = CGU_BASE_APB3_CLK_AUTOBLOCK
+      | CGU_BASE_APB3_CLK_CLK_SEL(clk_src);
 }
 
 /*
- Configure PLL1 to high speed with CGU_SRC_GP_CLKIN.
-(PLL1 High Speed compliant with UM10503 Rev. 1.8 — 28 January 2014 Fig 30. BASE_M4_CLK ramp-up procedure)
- Connect PLL1 to M4/M0 core, Peripheral, APB1, APB3.
+ Configure PLL1 to low speed with CGU_SRC_GP_CLKIN.
+ While no base clock runs from PLL1: sys_clock_init() runs them from the crystal meanwhile, then
+ connects PLL1 to M4/M0 core, Peripheral, APB1, APB3 and inits I2C0 & I2C1.
+*/
+void cpu_clock_pll1_low_speed(const core_clock_pll1_ls_t* const pt_cpu_clock_pll1_ls_conf)
+{
+  pll1_setup(pt_cpu_clock_pll1_ls_conf->pll1_ls_psel,
+             pt_cpu_clock_pll1_ls_conf->pll1_ls_nsel,
+             pt_cpu_clock_pll1_ls_conf->pll1_ls_msel);
+}
+
+/*
+ Configure PLL1 to high speed with CGU_SRC_GP_CLKIN, for M4/M0 core, Peripheral, APB1, APB3.
+ Above 110 MHz the core clock must go up in two steps, through about half the final frequency for at
+ least 50us (UM10503 Rev1.8 12.2.1, Fig 30. BASE_M4_CLK ramp-up procedure): PLL1 locks with the
+ post-divider doubled, then drops it. Its CCO keeps its frequency, so it relocks only once, while
+ those base clocks run from the IRC.
 */
 void cpu_clock_pll1_high_speed(const core_clock_pll1_hs_t* const pt_cpu_clock_pll1_hs_conf)
 {
-  uint32_t pll_reg;
-
   uint32_t pll1_psel;
   uint32_t pll1_nsel;
   uint32_t pll1_msel;
@@ -728,52 +737,17 @@ void cpu_clock_pll1_high_speed(const core_clock_pll1_hs_t* const pt_cpu_clock_pl
   pll1_nsel = pt_cpu_clock_pll1_hs_conf->pll1_hs_nsel;
   pll1_msel = pt_cpu_clock_pll1_hs_conf->pll1_hs_msel;
 
-  /* Configure PLL1 to Intermediate Clock final freq / 2 (because DIRECT=1) */
-  /* Integer mode:
-    FCLKOUT = M*(FCLKIN/N)
-    FCCO = 2*P*FCLKOUT = 2*P*M*(FCLKIN/N)
-  */
-  pll_reg = CGU_PLL1_CTRL;
-  /* Clear PLL1 bits */
-  pll_reg &= ~( CGU_PLL1_CTRL_CLK_SEL_MASK | CGU_PLL1_CTRL_PD | CGU_PLL1_CTRL_FBSEL |  /* CLK SEL, PowerDown , FBSEL */
-          CGU_PLL1_CTRL_BYPASS | /* BYPASS */
-          CGU_PLL1_CTRL_DIRECT | /* DIRECT */
-          CGU_PLL1_CTRL_PSEL_MASK | CGU_PLL1_CTRL_MSEL_MASK | CGU_PLL1_CTRL_NSEL_MASK ); /* PSEL, MSEL, NSEL- divider ratios */
-  
+  pll1_base_clocks(CGU_SRC_IRC);
+
   /* Set PLL1 to High Speed/2 */
-  pll_reg |= CGU_PLL1_CTRL_CLK_SEL(CGU_SRC_GP_CLKIN)
-        | CGU_PLL1_CTRL_PSEL(pll1_psel)
-        | CGU_PLL1_CTRL_NSEL(pll1_nsel)
-        | CGU_PLL1_CTRL_MSEL(pll1_msel)
-        | CGU_PLL1_CTRL_FBSEL;
-  CGU_PLL1_CTRL = pll_reg;
+  pll1_setup(pll1_psel + 1, pll1_nsel, pll1_msel);
+  pll1_base_clocks(CGU_SRC_PLL1);
 
-  /* wait until stable */
-  while (!(CGU_PLL1_STAT & CGU_PLL1_STAT_LOCK));
-
-  /* 
-  Wait before to switch to max speed (at least 50us) 
-  See UM10503 Rev1.8 Fig 30. BASE_M4_CLK ramp-up procedure Page 150 / 1420
-  */
+  /* Wait before to switch to max speed (at least 50us) */
   delay(WAIT_CPU_CLOCK_INIT_DELAY);
 
-  /* Configure PLL1 High Speed (DIRECT=1) */
-  /* Direct mode: FCLKOUT = FCCO = M*(FCLKIN/N) */
-  pll_reg = CGU_PLL1_CTRL;
-  /* Clear PLL1 bits */
-  pll_reg &= ~( CGU_PLL1_CTRL_CLK_SEL_MASK | CGU_PLL1_CTRL_PD | CGU_PLL1_CTRL_FBSEL |  /* CLK SEL, PowerDown , FBSEL */
-          CGU_PLL1_CTRL_BYPASS | /* BYPASS */
-          CGU_PLL1_CTRL_DIRECT | /* DIRECT */
-          CGU_PLL1_CTRL_PSEL_MASK | CGU_PLL1_CTRL_MSEL_MASK | CGU_PLL1_CTRL_NSEL_MASK ); /* PSEL, MSEL, NSEL- divider ratios */
   /* Set PLL1 to HighSpeed */
-  pll_reg |= CGU_PLL1_CTRL_CLK_SEL(CGU_SRC_GP_CLKIN)
-        | CGU_PLL1_CTRL_PSEL(pll1_psel)
-        | CGU_PLL1_CTRL_NSEL(pll1_nsel)
-        | CGU_PLL1_CTRL_MSEL(pll1_msel)
-        | CGU_PLL1_CTRL_FBSEL
-        | CGU_PLL1_CTRL_DIRECT;
-  CGU_PLL1_CTRL = pll_reg;
-  /* wait until stable */
+  CGU_PLL1_CTRL = (CGU_PLL1_CTRL & ~CGU_PLL1_CTRL_PSEL_MASK) | CGU_PLL1_CTRL_PSEL(pll1_psel);
   while (!(CGU_PLL1_STAT & CGU_PLL1_STAT_LOCK));
 }
 

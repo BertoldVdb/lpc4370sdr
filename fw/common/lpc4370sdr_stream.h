@@ -31,7 +31,8 @@ extern "C"
 {
 #endif
 
-/* ADC -> USB ring buffer, shared by the M4 */
+/* ADC -> USB ring buffer, shared by the M4. The linker scripts keep the ram_*_usb regions for it,
+ * see lpc4370sdr_stream.ld */
 #define LPC4370SDR_STREAM_PIECE_SIZE  (16384)
 #define LPC4370SDR_STREAM_NUM_PIECES  (11)
 #define LPC4370SDR_STREAM_SLOT_SIZE   (8192) /* one GPDMA linked-list item fills one slot */
@@ -78,7 +79,8 @@ typedef struct
   volatile uint32_t overruns; /* chunks the DMA started rewriting while their USB transfer was still pending (M4 DMA ISR) */
   volatile uint32_t backlog_max; /* highest number of chunks pending at the device */
   volatile uint32_t m0_lag_max;
-  volatile uint32_t dma_errors; /* GPDMA error interrupts: the ADC DMA could not write the ring (bus error) */
+  volatile uint32_t dma_errors; /* GPDMA error interrupts: the ADC DMA could not write the ring (bus error); the
+                                   DMA resumes with the next chunk, the one it was filling goes out damaged */
   volatile uint32_t adc_overflows; /* chunks in which the ADC FIFO overflow flag was set */
   /* PPS capture (M4 timer ISR) */
   volatile uint32_t pps_seq;
@@ -109,16 +111,21 @@ typedef struct
   volatile uint32_t dma_done; /* chunks the ADC DMA has completed (M4 DMA ISR) */
   volatile uint32_t overrun_last; /* index of the last chunk counted in overruns */
   volatile uint32_t usb_td[LPC4370SDR_STREAM_USB_POOL]; /* the stream's USB transfer descriptors, set by the M0 */
-  volatile uint32_t usb_qh; /* the bulk IN endpoint's queue head, set by the M0 */
+  volatile uint32_t usb_qh; /* the bulk IN endpoint's queue head, set by the M0 (for debugging, unused) */
   volatile uint32_t first_chunk; /* chunk counter value of the stream's first chunk, which fills ring position 0 */
   volatile uint32_t start_count; /* streams the M4 started since boot: lpc4370sdr_frame_header_t stream_start_count */
   /* Auxiliary UART receive (M0 UART ISR), for the PPS capture: bytes stored in the receive ring
      since boot, and the PPS timer's count read once the ISR had them - the last byte arrived no
-     later than that */
+     later than that. uart_seq is odd while the ISR writes them. The M4 zeroes all three before it
+     starts the M0: uart_in 0 means no byte received yet. */
   volatile uint32_t uart_seq;
   volatile uint32_t uart_in;
   volatile uint32_t uart_tick;
   volatile uint32_t uart_timer_tc; /* address of the PPS timer's count register, 0 = none yet (M4) */
+  volatile uint32_t dma_resyncs; /* chunks the M4 counted without their DMA interrupt: held off for over a chunk,
+                                    two merged (M4 DMA ISR) */
+  volatile uint32_t commands_refused; /* sample rate, packing and framing commands the M4 got while a stream
+                                         ran, acknowledged without effect: the M0 stops the stream first */
 } lpc4370sdr_stream_state_t;
 
 extern uint32_t cm4_data_share; /* defined in linker script */

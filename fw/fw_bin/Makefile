@@ -44,6 +44,9 @@ SRC += \
 
 LDSCRIPT = ../common/LPC4370_M4_rom_to_ram.ld
 
+# The build options of the M0 image (m0_bin.s), which the M4's must match
+M0_OPTS = ../m0/.opts
+
 %.o: ../$(SRC_DIR)/%.c  Makefile
 	@printf "  CC      $(subst $(shell pwd)/,,$(@))\n"
 	$(Q)$(CC) $(CFLAGS) -o $@ -c $<
@@ -56,7 +59,7 @@ m0s_bin.o: ../m0s/m0s.bin
 ../m0/m0.bin: ;
 ../m0s/m0s.bin: ;
 
-# RAM-only image for the LPC4370 ROM DFU mode
+# RAM-only image for the LPC4370 ROM DFU mode, from the same objects (the build options go along)
 dfu:
 	$(Q)$(MAKE) BINARY=lpc4370sdr_dfu LDSCRIPT=../common/LPC4370_M4_dfu.ld lpc4370sdr_dfu.dfu
 

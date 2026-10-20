@@ -72,6 +72,12 @@ typedef enum {
 } usb_standard_request_t;
 
 typedef enum {
+  USB_FEATURE_ENDPOINT_HALT = 0,
+  USB_FEATURE_DEVICE_REMOTE_WAKEUP = 1,
+  USB_FEATURE_TEST_MODE = 2,
+} usb_feature_selector_t;
+
+typedef enum {
   USB_SETUP_REQUEST_TYPE_RECIPIENT_mask = (0x1f),
   USB_SETUP_REQUEST_TYPE_RECIPIENT_DEVICE = 0,
   USB_SETUP_REQUEST_TYPE_RECIPIENT_INTERFACE = 1,

@@ -143,14 +143,33 @@ uint8_t nvic_get_irq_enabled(uint8_t irqn)
  *
  * There are 4 priority levels only, given by the upper two bits of the
  * priority byte, as required by ARM standards. No grouping available.
+ * The priority registers take word accesses only: the byte is written with
+ * a read-modify-write of its word, which the caller must not race with
+ * another priority change.
  *
  * @param[in] irqn Unsigned int8. Interrupt number @ref nvic_stm32f1_userint
  * @param[in] priority Unsigned int8. Interrupt priority (0 ... 255 in steps of
- * 16)
+ * 16, CM0: in steps of 64)
  */
 
 void nvic_set_priority(uint8_t irqn, uint8_t priority)
 {
+#if defined(__ARM_ARCH_6M__)
+	volatile uint32_t *reg;
+	uint32_t shift;
+
+	if (irqn >= NVIC_IRQ_COUNT) {
+		/* Cortex-M  system interrupts, see below */
+		uint32_t shpr_id = (irqn & 0xF) - 4;
+		reg = &MMIO32(SCS_BASE + 0xD18 + (shpr_id & ~3));
+		shift = (shpr_id & 3) * 8;
+	} else {
+		/* Device specific interrupts */
+		reg = &MMIO32(NVIC_BASE + 0x300 + (irqn & ~3));
+		shift = (irqn & 3) * 8;
+	}
+	*reg = (*reg & ~(0xFFu << shift)) | ((uint32_t)priority << shift);
+#else
 	/* code from lpc43xx/nvic.c -- this is quite a hack and alludes to the
 	 * negative interrupt numbers assigned to the system interrupts. better
 	 * handling would mean signed integers. */
@@ -161,6 +180,7 @@ void nvic_set_priority(uint8_t irqn, uint8_t priority)
 		/* Device specific interrupts */
 		NVIC_IPR(irqn) = priority;
 	}
+#endif
 }
 
 /* Those are defined only on CM3 or CM4 */

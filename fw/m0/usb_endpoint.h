@@ -37,7 +37,4 @@ extern USB_DECLARE_QUEUE(usb_endpoint_bulk_in);
 /* Transfer descriptor 'index' of the bulk IN pool, for the M4's overwrite check */
 const volatile usb_transfer_descriptor_t* usb_endpoint_bulk_in_td(const uint32_t index);
 
-extern usb_endpoint_t usb_endpoint_bulk_out;
-extern USB_DECLARE_QUEUE(usb_endpoint_bulk_out);
-
 #endif /* end of include guard: __USB_ENDPOINT_H__ */

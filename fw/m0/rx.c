@@ -44,7 +44,12 @@ void set_receiver_mode(const receiver_mode_t new_receiver_mode)
   if( new_receiver_mode == RECEIVER_MODE_RX )
   {
     usb_endpoint_init(&usb_endpoint_bulk_in);
-    ADCHS_start(sample_rate_conf_no);
+    /* Already running (SET_CONFIGURATION, a second RX request): the M4 keeps capturing, so the
+       tuner keeps its settings too */
+    if( receiver_mode == RECEIVER_MODE_RX )
+      ADCHS_continue();
+    else
+      ADCHS_start(sample_rate_conf_no);
     watchdog_host_contact();
   }else
   {

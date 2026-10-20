@@ -51,6 +51,18 @@ LDFLAGS += -mcpu=cortex-m0 -mthumb -DTHUMB \
 
 OBJ += $(SRC:.c=.o)
 
+# make DEBUG_REQUESTS=0, see Makefile_M0_inc.mk
+DEBUG_REQUESTS ?= 1
+ifeq ($(DEBUG_REQUESTS),0)
+CFLAGS += -DLPC4370SDR_NO_DEBUG_REQUESTS
+endif
+# The build options in effect: .opts changes (and every object rebuilds) when they do
+BUILD_OPTS := d$(DEBUG_REQUESTS)
+OPTS_STAMP = .opts
+ifneq ($(file < .opts),$(BUILD_OPTS))
+$(file > .opts,$(BUILD_OPTS))
+endif
+
 # Be silent per default, but 'make V=1' will show all compiler calls.
 ifneq ($(V),1)
 Q := @
@@ -69,19 +81,8 @@ all: images
 images: $(BINARY).images
 flash: $(BINARY).flash
 
-program: $(BINARY).dfu
-	$(Q)dfu-util --device 1fc9:000c --alt 0 --download $(BINARY).dfu
-
 %.images: %.bin %.hex %.srec %.list
 	@#echo "*** $* images generated ***"
-
-%.dfu: %.bin
-	$(Q)rm -f _tmp.dfu _header.bin
-	$(Q)cp $(*).bin _tmp.dfu
-	$(Q)dfu-suffix --vid=0x1fc9 --pid=0x000c --did=0x0 -s 0 -a _tmp.dfu
-	$(Q)python -c "import os.path; import struct; print('0000000: da ff ' + ' '.join(map(lambda s: '%02x' % ord(s), struct.pack('<H', os.path.getsize('$(*).bin') / 512 + 1))) + ' ff ff ff ff')" | xxd -g1 -r > _header.bin
-	$(Q)cat _header.bin _tmp.dfu >$(*).dfu
-	$(Q)rm -f _tmp.dfu _header.bin
 
 %.bin: %.elf
 	@#printf "  OBJCOPY $(*).bin\n"
@@ -113,6 +114,7 @@ program: $(BINARY).dfu
 
 clean:
 	$(Q)rm -f *.o
+	$(Q)rm -f .opts
 	$(Q)rm -f *.d
 	$(Q)rm -f *.elf
 	$(Q)rm -f *.bin
@@ -135,3 +137,8 @@ FORCE:
 # Anything that depends on FORCE will be considered out-of-date
 
 -include $(OBJ:.o=.d)
+
+# Recreates it after a clean in the same make run
+$(OPTS_STAMP):
+	$(file > $@,$(BUILD_OPTS))
+$(OBJ): $(OPTS_STAMP)

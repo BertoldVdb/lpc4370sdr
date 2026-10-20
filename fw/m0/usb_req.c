@@ -56,8 +56,6 @@
 #include "uart.h"
 #include "signal_mcu.h"
 
-#define ADDR_ALIGN_32BITS (3)
-
 extern const char version_string[];
 
 /* Allocate aligned buffer on 4bytes for 32bits store (this buffer shall be not less than 256bytes) */
@@ -99,7 +97,6 @@ __inline__ uint32_t gpio_get(uint32_t gpioport, uint32_t gpios)
 void usb_streaming_disable(void)
 {
 	usb_endpoint_disable(&usb_endpoint_bulk_in);
-	usb_endpoint_disable(&usb_endpoint_bulk_out);
 }
 
 deferred_job_t deferred_job;
@@ -118,14 +115,21 @@ static usb_request_status_t defer(usb_endpoint_t* const endpoint, deferred_kind_
 	return USB_REQUEST_STATUS_OK;
 }
 
+static volatile uint32_t tuner_standby_due;
+
+/* ADCHS_stop() in the USB ISR found a job pending: the tuner's standby runs as the next job */
+void deferred_tuner_standby(void)
+{
+	tuner_standby_due = 1;
+}
+
 /* Reply to the deferred request, unless the host gave up on it: a newer SETUP flushed its
-   transfers and must not get this reply. len < 0 stalls, 0 acks, else sends endpoint->buffer.
-   The job stays pending (defer() refuses others) until here: the host sends its next request
-   only after this reply, and no interrupt runs in between. */
-static void deferred_reply(usb_endpoint_t* endpoint, uint32_t setup_count, int len)
+   transfers and must not get this reply, nor have endpoint->buffer changed under it. len < 0
+   stalls, 0 acks, 1 sends value. The job stays pending (defer() refuses others) until here: the
+   host sends its next request only after this reply, and no interrupt runs in between. */
+static void deferred_reply(usb_endpoint_t* endpoint, uint32_t setup_count, int len, uint8_t value)
 {
 	cm_disable_interrupts();
-	deferred_job.pending = 0;
 	if(setup_count == usb_setup_count)
 	{
 		if(len < 0)
@@ -138,9 +142,20 @@ static void deferred_reply(usb_endpoint_t* endpoint, uint32_t setup_count, int l
 		}
 		else
 		{
-			usb_transfer_schedule_block(endpoint->in, &endpoint->buffer, len);
-			usb_transfer_schedule_ack(endpoint->out);
+			endpoint->buffer[0] = value;
+			usb_control_reply(endpoint, &endpoint->buffer, 1);
 		}
+	}
+	if(tuner_standby_due)
+	{
+		/* Next job: the standby, which replies to no request (its setup_count is a past one) */
+		tuner_standby_due = 0;
+		deferred_job.kind = DEFERRED_TUNER_STANDBY;
+		deferred_job.setup_count = setup_count - 1;
+	}
+	else
+	{
+		deferred_job.pending = 0;
 	}
 	cm_enable_interrupts();
 }
@@ -152,6 +167,7 @@ void deferred_job_run(void)
 	uint32_t index, value, setup_count;
 	uint64_t freq;
 	int reply = 0;
+	uint8_t value_out = 0;
 
 	if(!deferred_job.pending)
 		return;
@@ -164,7 +180,7 @@ void deferred_job_run(void)
 	switch(kind)
 	{
 	case DEFERRED_R82X_READ:
-		endpoint->buffer[0] = r82x_read_single(&lpc4370sdr_conf->r82x_conf_rw, index);
+		value_out = r82x_read_single(&lpc4370sdr_conf->r82x_conf_rw, index);
 		reply = 1;
 		break;
 	case DEFERRED_R82X_WRITE:
@@ -181,20 +197,23 @@ void deferred_job_run(void)
 		/* Calibration change: the new crystal frequency is in effect whatever the tuner does */
 		r82x_set_freq(&lpc4370sdr_conf->r82x_conf_rw, set_freq_params.freq_hz);
 		break;
-	case DEFERRED_LNA_GAIN:   endpoint->buffer[0] = r82x_set_lna_gain(&lpc4370sdr_conf->r82x_conf_rw, index); reply = 1; break;
-	case DEFERRED_MIXER_GAIN: endpoint->buffer[0] = r82x_set_mixer_gain(&lpc4370sdr_conf->r82x_conf_rw, index); reply = 1; break;
-	case DEFERRED_VGA_GAIN:   endpoint->buffer[0] = r82x_set_vga_gain(&lpc4370sdr_conf->r82x_conf_rw, index); reply = 1; break;
-	case DEFERRED_LNA_AGC:    endpoint->buffer[0] = r82x_set_lna_agc(&lpc4370sdr_conf->r82x_conf_rw, index); reply = 1; break;
-	case DEFERRED_MIXER_AGC:  endpoint->buffer[0] = r82x_set_mixer_agc(&lpc4370sdr_conf->r82x_conf_rw, index); reply = 1; break;
+	case DEFERRED_LNA_GAIN:   value_out = r82x_set_lna_gain(&lpc4370sdr_conf->r82x_conf_rw, index); reply = 1; break;
+	case DEFERRED_MIXER_GAIN: value_out = r82x_set_mixer_gain(&lpc4370sdr_conf->r82x_conf_rw, index); reply = 1; break;
+	case DEFERRED_VGA_GAIN:   value_out = r82x_set_vga_gain(&lpc4370sdr_conf->r82x_conf_rw, index); reply = 1; break;
+	case DEFERRED_LNA_AGC:    value_out = r82x_set_lna_agc(&lpc4370sdr_conf->r82x_conf_rw, index); reply = 1; break;
+	case DEFERRED_MIXER_AGC:  value_out = r82x_set_mixer_agc(&lpc4370sdr_conf->r82x_conf_rw, index); reply = 1; break;
 	case DEFERRED_SET_RF_PORT:
-		endpoint->buffer[0] = (r82x_set_rf_port(&lpc4370sdr_conf->r82x_conf_rw, (lpc4370sdr_rf_port_t)index) == 0) ? 1 : 0;
+		value_out = (r82x_set_rf_port(&lpc4370sdr_conf->r82x_conf_rw, (lpc4370sdr_rf_port_t)index) == 0) ? 1 : 0;
 		reply = 1;
+		break;
+	case DEFERRED_TUNER_STANDBY:
+		ADCHS_tuner_standby();
 		break;
 	default:
 		deferred_job.pending = 0;
 		return;
 	}
-	deferred_reply(endpoint, setup_count, reply);
+	deferred_reply(endpoint, setup_count, reply, value_out);
 }
 
 usb_request_status_t usb_vendor_request_set_receiver_mode(
@@ -206,8 +225,12 @@ const usb_transfer_stage_t stage
 	{
 		switch( endpoint->setup.value )
 		{
-			case RECEIVER_MODE_OFF:
 			case RECEIVER_MODE_RX:
+				/* Not configured: no bulk endpoint. A pending tuner job: ADCHS_start() needs I2C */
+				if( endpoint->device->configuration == NULL || deferred_job.pending )
+					return USB_REQUEST_STATUS_STALL;
+				/* fall through */
+			case RECEIVER_MODE_OFF:
 				set_receiver_mode(endpoint->setup.value);
 				usb_transfer_schedule_ack(endpoint->in);
 				return USB_REQUEST_STATUS_OK;
@@ -262,8 +285,7 @@ const usb_transfer_stage_t stage)
 		{
 			const uint8_t value = si5351c_read_single(endpoint->setup.index);
 			endpoint->buffer[0] = value;
-			usb_transfer_schedule_block(endpoint->in, &endpoint->buffer, 1);
-			usb_transfer_schedule_ack(endpoint->out);
+			usb_control_reply(endpoint, &endpoint->buffer, 1);
 			return USB_REQUEST_STATUS_OK;
 		}
 		return USB_REQUEST_STATUS_STALL;
@@ -317,8 +339,8 @@ usb_endpoint_t* const endpoint, const usb_transfer_stage_t stage)
 #else
 	if (stage == USB_TRANSFER_STAGE_SETUP)
 	{
-		w25q80bv_setup();
-		w25q80bv_sector_erase(0); /* Erase 1st sector 64KB */
+		if (w25q80bv_setup() != 0 || w25q80bv_sector_erase(0) != 0) /* Erase 1st sector 64KB */
+			return USB_REQUEST_STATUS_STALL;
 		usb_transfer_schedule_ack(endpoint->in);
 	}
 	return USB_REQUEST_STATUS_OK;
@@ -337,29 +359,28 @@ usb_endpoint_t* const endpoint, const usb_transfer_stage_t stage)
 
 	if (stage == USB_TRANSFER_STAGE_SETUP)
 	{
-		addr = (endpoint->setup.value << 16) | endpoint->setup.index;
+		addr = ((uint32_t)endpoint->setup.value << 16) | endpoint->setup.index;
 		len = endpoint->setup.length;
 		if ((len > W25Q80BV_PAGE_LEN) || (addr > W25Q80BV_NUM_BYTES)
-				|| ((addr + len) > W25Q80BV_NUM_BYTES))
+				|| ((addr + len) > W25Q80BV_NUM_BYTES) || (w25q80bv_setup() != 0))
 		{
 			return USB_REQUEST_STATUS_STALL;
 		} else
 		{
 			usb_transfer_schedule_block(endpoint->out, &spiflash_buffer[0], len);
-			w25q80bv_setup();
 			return USB_REQUEST_STATUS_OK;
 		}
 	} else if (stage == USB_TRANSFER_STAGE_DATA)
 	{
-		addr = (endpoint->setup.value << 16) | endpoint->setup.index;
+		addr = ((uint32_t)endpoint->setup.value << 16) | endpoint->setup.index;
 		len = endpoint->setup.length;
 		/* This check is redundant but makes me feel better. */
 		if ((len > W25Q80BV_PAGE_LEN) || (addr > W25Q80BV_NUM_BYTES)
-				|| ((addr + len) > W25Q80BV_NUM_BYTES))
+				|| ((addr + len) > W25Q80BV_NUM_BYTES)
+				|| (w25q80bv_program(addr, len, &spiflash_buffer[0]) != 0))
 		{
 			return USB_REQUEST_STATUS_STALL;
 		} else {
-			w25q80bv_program(addr, len, &spiflash_buffer[0]);
 			usb_transfer_schedule_ack(endpoint->in);
 			return USB_REQUEST_STATUS_OK;
 		}
@@ -376,54 +397,26 @@ usb_endpoint_t* const endpoint, const usb_transfer_stage_t stage)
 	(void)endpoint; (void)stage;
 	return USB_REQUEST_STATUS_STALL; /* flashless build */
 #else
-	uint32_t i;
 	uint32_t addr;
 	uint16_t len;
-	uint8_t* u8_addr_pt;
-	uint32_t* u32_addr_pt;
-	uint32_t* u32_dest_pt;
 
 	if (stage == USB_TRANSFER_STAGE_SETUP) 
 	{
-		addr = (endpoint->setup.value << 16) | endpoint->setup.index;
+		addr = ((uint32_t)endpoint->setup.value << 16) | endpoint->setup.index;
 		len = endpoint->setup.length;
 
-		if(len > W25Q80BV_PAGE_LEN)
+		/* The flash only (memory: LPC4370SDR_MEM_READ) */
+		if((len > W25Q80BV_PAGE_LEN) || (addr > W25Q80BV_NUM_BYTES) || ((addr + len) > W25Q80BV_NUM_BYTES)
+				|| (w25q80bv_setup() != 0) || (w25q80bv_read(addr, len, &spiflash_buffer[0]) != 0))
 		{
 			return USB_REQUEST_STATUS_STALL;
 		} else 
 		{
-			if((addr + len) > W25Q80BV_NUM_BYTES)
-			{
-				if( (len >= 4) &&
-						((len & ADDR_ALIGN_32BITS) == 0) &&
-						((addr & ADDR_ALIGN_32BITS) == 0)
-					)
-				{
-					u32_addr_pt = (uint32_t*)addr;
-					u32_dest_pt = (uint32_t*)&spiflash_buffer[0];
-					for(i=0; i<(len/4); i++)
-					{
-						u32_dest_pt[i] = u32_addr_pt[i];
-					}
-				} else
-				{
-					u8_addr_pt = (uint8_t*)addr;
-					for(i=0; i<len; i++)
-					{
-						spiflash_buffer[i] = u8_addr_pt[i];
-					}
-				}
-			} else
-			{
-				w25q80bv_read(addr, len, &spiflash_buffer[0]);
-			}
 			usb_transfer_schedule_block(endpoint->in, &spiflash_buffer[0], len);
 			return USB_REQUEST_STATUS_OK;
 		}
 	} else if (stage == USB_TRANSFER_STAGE_DATA) 
 	{
-		addr = (endpoint->setup.value << 16) | endpoint->setup.index;
 		len = endpoint->setup.length;
 		/* This check is redundant but makes me feel better. */
 		if(len > W25Q80BV_PAGE_LEN) 
@@ -446,8 +439,7 @@ usb_endpoint_t* const endpoint, const usb_transfer_stage_t stage)
 {
 	if (stage == USB_TRANSFER_STAGE_SETUP) {
 		endpoint->buffer[0] = BOARD_IS_AIRSPY() ? 0 : BOARD_ID; /* Airspy firmware reports 0 on every board */
-		usb_transfer_schedule_block(endpoint->in, &endpoint->buffer, 1);
-		usb_transfer_schedule_ack(endpoint->out);
+		usb_control_reply(endpoint, &endpoint->buffer, 1);
 	}
 	return USB_REQUEST_STATUS_OK;
 }
@@ -538,6 +530,9 @@ const usb_transfer_stage_t stage)
 		rx_mode = get_receiver_mode();
 		if(rx_mode == RECEIVER_MODE_RX)
 		{
+			/* The restart needs the tuner, see usb_vendor_request_set_receiver_mode() */
+			if(deferred_job.pending)
+				return USB_REQUEST_STATUS_STALL;
 			/* Restarts the stream, framing and SOF tagging stay on */
 			ADCHS_stop(sample_rate_conf_no);
 			set_packing_m4(state);
@@ -549,8 +544,7 @@ const usb_transfer_stage_t stage)
 		}
 
 		endpoint->buffer[0] = 1;
-		usb_transfer_schedule_block(endpoint->in, &endpoint->buffer, 1);
-		usb_transfer_schedule_ack(endpoint->out);
+		usb_control_reply(endpoint, &endpoint->buffer, 1);
 		return USB_REQUEST_STATUS_OK;
 	}
 	return USB_REQUEST_STATUS_OK;
@@ -570,6 +564,13 @@ const usb_transfer_stage_t stage)
 
 	if( stage == USB_TRANSFER_STAGE_SETUP )
 	{
+		/* The restart needs the tuner, see usb_vendor_request_set_receiver_mode() */
+		rx_mode = get_receiver_mode();
+		if(rx_mode == RECEIVER_MODE_RX && deferred_job.pending)
+		{
+			return USB_REQUEST_STATUS_STALL;
+		}
+
 		conf_no = endpoint->setup.index;
 		if(conf_no < LPC4370SDR_CONF_NB_MAX)
 		{
@@ -617,7 +618,6 @@ const usb_transfer_stage_t stage)
 			}
 		}
 
-		rx_mode = get_receiver_mode();
 		if(rx_mode == RECEIVER_MODE_RX)
 		{
 			ADCHS_stop(sample_rate_conf_no);
@@ -631,8 +631,7 @@ const usb_transfer_stage_t stage)
 		}
 
 		endpoint->buffer[0] = 1;
-		usb_transfer_schedule_block(endpoint->in, &endpoint->buffer, 1);
-		usb_transfer_schedule_ack(endpoint->out);
+		usb_control_reply(endpoint, &endpoint->buffer, 1);
 		return USB_REQUEST_STATUS_OK;
 	}
 	return USB_REQUEST_STATUS_OK;
@@ -837,8 +836,7 @@ const usb_transfer_stage_t stage)
 				value = gpio_get(port_num, pin_num);
 			}
 			endpoint->buffer[0] = value;
-			usb_transfer_schedule_block(endpoint->in, &endpoint->buffer, 1);
-			usb_transfer_schedule_ack(endpoint->out);
+			usb_control_reply(endpoint, &endpoint->buffer, 1);
 			return USB_REQUEST_STATUS_OK;
 		}
 		return USB_REQUEST_STATUS_STALL;
@@ -913,8 +911,7 @@ const usb_transfer_stage_t stage)
 				value = 0;
 			}
 			endpoint->buffer[0] = value;
-			usb_transfer_schedule_block(endpoint->in, &endpoint->buffer, 1);
-			usb_transfer_schedule_ack(endpoint->out);
+			usb_control_reply(endpoint, &endpoint->buffer, 1);
 			return USB_REQUEST_STATUS_OK;
 		}
 		return USB_REQUEST_STATUS_STALL;
@@ -951,7 +948,7 @@ usb_endpoint_t* const endpoint, const usb_transfer_stage_t stage)
 		{
 			/* Return the number of samplerates available */
 			samplerates_buffer[0] = lpc4370sdr_conf_nb;
-			usb_transfer_schedule_block(endpoint->in, &samplerates_buffer[0], 4);
+			usb_control_reply(endpoint, &samplerates_buffer[0], 4);
 		} else
 		{
 			/* Return each samplerate available */
@@ -960,9 +957,8 @@ usb_endpoint_t* const endpoint, const usb_transfer_stage_t stage)
 				samplerates_buffer[i] = lpc4370sdr_conf->m0_m4_conf[i].m0_conf.r82x_if_freq * 2; /* samplerate = IF_freq * 2 */
 			}
 			schedule_block_len = nb_samplerate * sizeof(uint32_t);
-			usb_transfer_schedule_block(endpoint->in, &samplerates_buffer[0], schedule_block_len);
+			usb_control_reply(endpoint, &samplerates_buffer[0], schedule_block_len);
 		}
-		usb_transfer_schedule_ack(endpoint->out);
 		return USB_REQUEST_STATUS_OK;
 	} else 
 	{
@@ -988,6 +984,9 @@ const usb_transfer_stage_t stage)
 		rx_mode = get_receiver_mode();
 		if(rx_mode == RECEIVER_MODE_RX)
 		{
+			/* The restart needs the tuner, see usb_vendor_request_set_receiver_mode() */
+			if(deferred_job.pending)
+				return USB_REQUEST_STATUS_STALL;
 			ADCHS_stop(sample_rate_conf_no);
 		}
 		set_framing_m4(state);
@@ -997,8 +996,7 @@ const usb_transfer_stage_t stage)
 		}
 
 		endpoint->buffer[0] = 1;
-		usb_transfer_schedule_block(endpoint->in, &endpoint->buffer, 1);
-		usb_transfer_schedule_ack(endpoint->out);
+		usb_control_reply(endpoint, &endpoint->buffer, 1);
 		return USB_REQUEST_STATUS_OK;
 	}
 	return USB_REQUEST_STATUS_OK;
@@ -1079,9 +1077,11 @@ usb_endpoint_t* const endpoint, const usb_transfer_stage_t stage)
 		{
 			return USB_REQUEST_STATUS_STALL;
 		}
-		w25q80bv_setup();
 		addr = (sector * MAX_SECTOR_SIZE_64KB);
-		w25q80bv_sector_erase(addr); /* Erase 64KB */
+		if(w25q80bv_setup() != 0 || w25q80bv_sector_erase(addr) != 0) /* Erase 64KB */
+		{
+			return USB_REQUEST_STATUS_STALL;
+		}
 		usb_transfer_schedule_ack(endpoint->in);
 	}
 	return USB_REQUEST_STATUS_OK;
@@ -1183,8 +1183,6 @@ usb_endpoint_t* const endpoint, const usb_transfer_stage_t stage)
 }
 
 static uint8_t mem_buffer[64] __attribute__ ((aligned(4)));
-static lpc4370sdr_call_request_t call_request;
-static lpc4370sdr_call_result_t call_result;
 
 static void mem_copy(void* dst, const void* src, uint32_t len)
 {
@@ -1214,11 +1212,15 @@ usb_endpoint_t* const endpoint, const usb_transfer_stage_t stage)
 		if(len == 0 || len > sizeof(mem_buffer))
 			return USB_REQUEST_STATUS_STALL;
 		mem_copy(mem_buffer, (const void*)addr, len);
-		usb_transfer_schedule_block(endpoint->in, mem_buffer, len);
-		usb_transfer_schedule_ack(endpoint->out);
+		usb_control_reply(endpoint, mem_buffer, len);
 	}
 	return USB_REQUEST_STATUS_OK;
 }
+
+#ifndef LPC4370SDR_NO_DEBUG_REQUESTS
+static lpc4370sdr_call_request_t call_request;
+static lpc4370sdr_call_result_t call_result;
+static uint8_t call_on_m4; /* the last call went to the M4's mailbox: its state is the result */
 
 usb_request_status_t usb_vendor_request_mem_write(
 usb_endpoint_t* const endpoint, const usb_transfer_stage_t stage)
@@ -1248,7 +1250,7 @@ usb_endpoint_t* const endpoint, const usb_transfer_stage_t stage)
 	{
 		if(stage == USB_TRANSFER_STAGE_SETUP)
 		{
-			if(call_request.core == 1)
+			if(call_on_m4)
 			{
 				call_result.status = LPC4370SDR_DEBUG_MAILBOX->pending ? 1 : 0;
 				call_result.r0 = LPC4370SDR_DEBUG_MAILBOX->result;
@@ -1265,6 +1267,7 @@ usb_endpoint_t* const endpoint, const usb_transfer_stage_t stage)
 	}
 	else if(stage == USB_TRANSFER_STAGE_DATA)
 	{
+		call_on_m4 = 0;
 		if(call_request.address < 0x1000)
 		{
 			call_result.status = 2; /* a null call would only fault the core */
@@ -1275,8 +1278,13 @@ usb_endpoint_t* const endpoint, const usb_transfer_stage_t stage)
 			call_result.r0 = fn(call_request.r[0], call_request.r[1], call_request.r[2], call_request.r[3]);
 			call_result.status = 0;
 		}
+		else if(call_request.core == 1 && LPC4370SDR_DEBUG_MAILBOX->pending)
+		{
+			call_result.status = 1; /* the M4 still runs the previous call: this one is not taken */
+		}
 		else if(call_request.core == 1)
 		{
+			call_on_m4 = 1;
 			LPC4370SDR_DEBUG_MAILBOX->address = call_request.address;
 			LPC4370SDR_DEBUG_MAILBOX->args[0] = call_request.r[0];
 			LPC4370SDR_DEBUG_MAILBOX->args[1] = call_request.r[1];
@@ -1293,6 +1301,7 @@ usb_endpoint_t* const endpoint, const usb_transfer_stage_t stage)
 	}
 	return USB_REQUEST_STATUS_OK;
 }
+#endif /* LPC4370SDR_NO_DEBUG_REQUESTS */
 
 usb_request_handler_fn vendor_request_handler[LPC4370SDR_CMD_MAX+1];
 usb_request_handler_fn ext_vendor_request_handler[LPC4370SDR_EXT_CMD_MAX-LPC4370SDR_EXT_CMD_BASE+1];
@@ -1358,8 +1367,10 @@ void usb_req_init(void)
 	ext_vendor_request_handler[LPC4370SDR_SET_CALIBRATION-LPC4370SDR_EXT_CMD_BASE] = usb_vendor_request_set_calibration;
 	ext_vendor_request_handler[LPC4370SDR_GET_CALIBRATION-LPC4370SDR_EXT_CMD_BASE] = usb_vendor_request_get_calibration;
 	ext_vendor_request_handler[LPC4370SDR_MEM_READ-LPC4370SDR_EXT_CMD_BASE] = usb_vendor_request_mem_read;
+#ifndef LPC4370SDR_NO_DEBUG_REQUESTS
 	ext_vendor_request_handler[LPC4370SDR_MEM_WRITE-LPC4370SDR_EXT_CMD_BASE] = usb_vendor_request_mem_write;
 	ext_vendor_request_handler[LPC4370SDR_CALL-LPC4370SDR_EXT_CMD_BASE] = usb_vendor_request_call;
+#endif
 }
 
 usb_request_status_t usb_vendor_request(usb_endpoint_t* const endpoint, const usb_transfer_stage_t stage)

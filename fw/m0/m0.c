@@ -258,16 +258,48 @@ static void stream_write_header(uint8_t* chunk, uint32_t chunk_index, uint32_t c
 
 void usb_configuration_changed(usb_device_t* const device)
 {
-  if( device->configuration->number )
+  if( device->configuration && device->configuration->number )
   {
     /* RECEIVER ON */
     set_receiver_mode(get_receiver_mode());
   } else
   {
     /* RECEIVER OFF */
-    /* Configuration number equal 0 means usb bus reset. */
+    /* No configuration: usb bus reset or SET_CONFIGURATION(0). */
     set_receiver_mode(RECEIVER_MODE_OFF);
   }
+}
+
+/* PLL1 output from its control register: the M4 changes it (high speed from the first stream on).
+   PLL1 runs from GP_CLKIN: 20 MHz from the SI5351C, the Mini's 24 MHz crystal otherwise. */
+static uint32_t pll1_hz(void)
+{
+  const uint32_t ctrl = CGU_PLL1_CTRL;
+  const uint32_t m = ((ctrl & CGU_PLL1_CTRL_MSEL_MASK) >> CGU_PLL1_CTRL_MSEL_SHIFT) + 1;
+  const uint32_t n = ((ctrl & CGU_PLL1_CTRL_NSEL_MASK) >> CGU_PLL1_CTRL_NSEL_SHIFT) + 1;
+  const uint32_t p2 = 2u << ((ctrl & CGU_PLL1_CTRL_PSEL_MASK) >> CGU_PLL1_CTRL_PSEL_SHIFT); /* 2*P */
+  uint32_t hz = (lpc4370sdr_conf->conf_hw.hardware_type & HW_FEATURE_SI5351C) ? 20000000 : 24000000;
+
+  if((ctrl & CGU_PLL1_CTRL_BYPASS) == 0)
+  {
+    /* Direct and integer mode: the output is M*FCLKIN/N; non-integer mode: that is the CCO */
+    hz = hz / n * m;
+    if((ctrl & (CGU_PLL1_CTRL_DIRECT | CGU_PLL1_CTRL_FBSEL)) == 0)
+      hz /= p2;
+  }
+  else if((ctrl & CGU_PLL1_CTRL_DIRECT) == 0)
+  {
+    hz /= p2;
+  }
+  return hz;
+}
+
+/* I2C0 (Si5351C) and I2C1 (R82X) at 400 kHz at most, for the PLL1 frequency in effect (APB1 and APB3) */
+static void i2c_init_pll1(void)
+{
+  const uint32_t count = (pll1_hz() + 2 * 400000 - 1) / (2 * 400000); /* SCLH = SCLL */
+  i2c0_init(count);
+  i2c1_init(count);
 }
 
 void ADCHS_start(uint8_t conf_num)
@@ -285,8 +317,7 @@ void ADCHS_start(uint8_t conf_num)
   //enable_r82x_power();
 
   /* Re-Init I2C0 & I2C1 after PLL1 frequency is modified (for I2C1 also because PowerOn on R82X) */
-  i2c0_init(lpc4370sdr_conf->i2c_conf.i2c0_pll1_ls_hs_conf_val); /* Si5351C I2C peripheral */
-  i2c1_init(lpc4370sdr_conf->i2c_conf.i2c1_pll1_hs_conf_val); /* R82X I2C peripheral */
+  i2c_init_pll1();
 
   if((conf_num & LPC4370SDR_SAMPLERATE_CONF_ALT) == LPC4370SDR_SAMPLERATE_CONF_ALT)
   {
@@ -302,19 +333,37 @@ void ADCHS_start(uint8_t conf_num)
   stream_epoch++;
 }
 
+/* The receiver keeps running with a new USB endpoint (SET_CONFIGURATION or a second RX request):
+   the stream and the tuner go on, the main loop requeues */
+void ADCHS_continue(void)
+{
+  stream_epoch++;
+}
+
+/* The tuner's part of ADCHS_stop(), see there */
+void ADCHS_tuner_standby(void)
+{
+  r82x_standby();
+  /* Re-Init I2C0 & I2C1 after PLL1 frequency is modified. The M4 leaves PLL1 at its high speed
+     once the first stream started (its low speed switch is disabled). */
+  i2c_init_pll1();
+}
+
 /* Framing and SOF tagging stay as they are: a setting change restarts the stream with them.
    set_receiver_mode() clears them when the receiver goes off. */
 void ADCHS_stop(uint8_t conf_num)
 {
   /* Retire the transfers still pointing into the ring before the M4 clears and refills it */
   usb_endpoint_flush(&usb_endpoint_bulk_in);
-  r82x_standby();
   start_stop_adchs_m4(conf_num, STOP_ADCHS_CMD);
 
-  /* Re-Init I2C0 & I2C1 after PLL1 frequency is modified. The M4 leaves PLL1 at its high speed
-     once the first stream started (its low speed switch is disabled). */
-  i2c0_init(lpc4370sdr_conf->i2c_conf.i2c0_pll1_ls_hs_conf_val); /* Si5351C I2C peripheral */
-  i2c1_init(lpc4370sdr_conf->i2c_conf.i2c1_pll1_hs_conf_val); /* R82X I2C peripheral */
+  /* The requests that start the receiver stall while a tuner job is pending, the ones that stop
+     it cannot (bus reset, SET_CONFIGURATION): the job may be in the middle of an I2C transfer
+     this interrupt broke into, the main loop puts the tuner to standby after it */
+  if(deferred_job.pending)
+    deferred_tuner_standby();
+  else
+    ADCHS_tuner_standby();
   stream_epoch++;
 }
 
@@ -449,7 +498,6 @@ int main(void)
 
   usb_queue_init(&usb_endpoint_control_out_queue);
   usb_queue_init(&usb_endpoint_control_in_queue);
-  usb_queue_init(&usb_endpoint_bulk_out_queue);
   usb_queue_init(&usb_endpoint_bulk_in_queue);
 
   usb_endpoint_init(&usb_endpoint_control_out);
@@ -466,9 +514,10 @@ int main(void)
     usb_descriptor_fill_string_serial_number(serial_number);
   }
 
-  nvic_set_priority(NVIC_USB0_IRQ, 255);
-  
-  nvic_set_priority(NVIC_M4CORE_IRQ, 1);
+  /* See M0_IRQ_PRIORITY_*: watchdog_init() put the watchdog warning above both */
+  nvic_set_priority(NVIC_USB0_IRQ, M0_IRQ_PRIORITY_USB);
+
+  nvic_set_priority(NVIC_M4CORE_IRQ, M0_IRQ_PRIORITY_M4CORE);
   nvic_enable_irq(NVIC_M4CORE_IRQ);
 
   usb_run(&usb_device);

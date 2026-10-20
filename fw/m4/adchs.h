@@ -34,10 +34,10 @@ void ADCHS_deinit(void);
 void ADCHS_init(void);
 void ADCHS_set_sample_rate(uint32_t hz); /* selects the CRS / DGEC bias (UM10503 table 1129) used by ADCHS_init */
 void ADCHS_DMA_init(uint8_t packed, uint32_t header_bytes);
+uint32_t ADCHS_DMA_lli_in_progress(void); /* the ring slot the DMA fills */
+void ADCHS_DMA_restart(uint32_t chunk_slots);
 void ADCHS_desc_init(uint8_t chan_num);
-void ADCHS_stop(uint8_t conf_num);
 
-void adchs_isr(void);
 void dma_isr(void);
 
 #include <lpc4370sdr_stream.h>
@@ -190,8 +190,6 @@ typedef struct {
 #define ADC_NUM           3 // LPC4370FET100 max 3 chan only
 #define ADC_FIFO_LEVEL  0x8
 #define ADC_DESC_NUM      8 // Num ADCHS descriptors
-#define ADC_CRS         0x3
-#define ADC_CRS_SPEED   0xF
 
 #ifdef __cplusplus
 }

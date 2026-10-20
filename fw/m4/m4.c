@@ -59,10 +59,8 @@
 
 #define SLAVE_TXEV_QUIT() { CREG_M0TXEVENT = 0x0; __asm__ volatile("dsb" ::: "memory"); }
 
-extern uint32_t adchs_data; /* defined in linker script */
 extern uint32_t cm0_data_share; /* defined in linker script */
 
-volatile int adchs_stopped = 0;
 volatile int adchs_started = 0;
 
 volatile lpc4370sdr_packing_type use_packing = LPC4370SDR_PACKING_OFF;
@@ -71,7 +69,9 @@ volatile int use_framing = 0;
 volatile lpc4370sdr_stream_state_t * const stream = LPC4370SDR_STREAM_STATE;
 
 /* First chunk counter value of a stream. The counters and their ring positions are kept apart, so
- * they may wrap: a debug build can start them just short of the 32-bit wrap to test it. */
+ * they may wrap: a debug build can start them just short of the 32-bit wrap to test it. Only the
+ * chunk index starts there: the PPS and SOF sample indices still count from 0 at the stream start,
+ * so with a value other than 0 they no longer equal chunk_index times the chunk's samples. */
 #ifndef LPC4370SDR_STREAM_COUNTER_START
 #define LPC4370SDR_STREAM_COUNTER_START (0)
 #endif
@@ -231,6 +231,7 @@ static __inline__ void stream_reset(void)
   stream->backlog_max = 0;
   stream->m0_lag_max = 0;
   stream->dma_errors = 0;
+  stream->dma_resyncs = 0;
   stream->adc_overflows = 0;
 }
 
@@ -344,11 +345,12 @@ void set_framing_state(uint8_t state)
 
 static uint32_t adchs_sample_rate_hz;
 
+/* PLL1 at its high speed, see cpu_clock_pll1_high_speed() */
 static uint32_t timing_timer_clock_hz(void)
 {
   const core_clock_pll1_hs_t* pll1 = &lpc4370sdr_conf->m4_init_conf.pll1_hs;
   uint32_t gp_clkin_hz = (lpc4370sdr_conf->conf_hw.hardware_type & HW_FEATURE_SI5351C) ? 20000000 : 24000000;
-  return (gp_clkin_hz / (pll1->pll1_hs_nsel + 1)) * (pll1->pll1_hs_msel + 1);
+  return (gp_clkin_hz / (pll1->pll1_hs_nsel + 1)) * (pll1->pll1_hs_msel + 1) / (2 << pll1->pll1_hs_psel);
 }
 
 void adchs_start(uint8_t chan_num)
@@ -418,7 +420,11 @@ static inline void write_unpacked_tail(uint32_t pos, uint32_t chunk)
   tail[w] = ~chunk;
 }
 
-__attribute__ ((always_inline)) static inline void dma_chunk_done(uint32_t adc_status)
+#define DMA_CLEAR_NO      (0) /* the DMA has rewritten the next slot already */
+#define DMA_CLEAR         (1) /* it has just started the next slot */
+#define DMA_CLEAR_IF_DUE  (2) /* it fills the next slot, since when is not known */
+
+__attribute__ ((always_inline)) static inline void dma_chunk_done(uint32_t adc_status, uint32_t clear_next)
 {
   uint32_t done = dma_chunks_done;
   uint32_t produced = done + 1;
@@ -446,9 +452,16 @@ __attribute__ ((always_inline)) static inline void dma_chunk_done(uint32_t adc_s
   stream->dma_done = produced;
 
   /* The DMA now rewrites the slot of chunk (produced - ring_chunks): clear its tail marker first, so
-     a transfer of that chunk that reads its tail from now on sees the chunk as damaged */
-  if(stream->header_bytes)
-    *(volatile uint32_t*)(lpc4370sdr_stream_slot(next_pos * chunk_slots) + stream->chunk_bytes - 4) = 0;
+     a transfer of that chunk that reads its tail from now on sees the chunk as damaged. In the packed
+     modes that word lies in the DMA's raw input: cleared as the DMA starts the slot, long before it
+     gets there, it is overwritten by samples and pack_chunk() writes the new marker. Not once the
+     DMA may have got there: that would clear a sample. */
+  if(stream->header_bytes && clear_next != DMA_CLEAR_NO)
+  {
+    volatile uint32_t* marker = (volatile uint32_t*)(lpc4370sdr_stream_slot(next_pos * chunk_slots) + stream->chunk_bytes - 4);
+    if(clear_next == DMA_CLEAR || use_packing == LPC4370SDR_PACKING_OFF || LPC_GPDMA->C0DESTADDR + 256 < (uint32_t)marker)
+      *marker = 0;
+  }
 
   if(queued != stream->first_chunk)
   {
@@ -490,11 +503,32 @@ __attribute__ ((always_inline)) static inline void dma_chunk_done(uint32_t adc_s
   }
 }
 
+#define INTTC0  (1)
+#define INTERR0 (1)
+
+/* The chunks the DMA finished without a terminal count interrupt of their own: when this interrupt
+   is held off for longer than a chunk, two of them merge. The channel's linked-list item tells the
+   chunk it fills; one it has just left whose interrupt is still pending is counted by that
+   interrupt. The item is read before the pending flag, so a chunk that ends in between counts there. */
+__attribute__ ((always_inline)) static inline uint32_t dma_chunks_unsignalled(uint32_t signalled)
+{
+  const uint32_t ring_chunks = stream->ring_chunks;
+  uint32_t ahead = ADCHS_DMA_lli_in_progress() / stream->chunk_slots + 2 * ring_chunks - dma_pos - signalled;
+
+  while(ahead >= ring_chunks)
+    ahead -= ring_chunks;
+  if(LPC_GPDMA->INTTCSTAT & INTTC0)
+    ahead--;
+  /* Behind: the channel has not loaded the next item yet */
+  return (ahead > ring_chunks / 2) ? 0 : ahead;
+}
+
 void dma_isr(void) 
 {
   uint32_t status;
+  uint32_t errors;
   uint32_t adc_status;
-  #define INTTC0  (1)
+  uint32_t done, missed;
 
 #ifdef DMA_ISR_DEBUG
   volatile uint32_t tmp_cycles;
@@ -504,36 +538,6 @@ void dma_isr(void)
   stat_adchs.freq_dma_irq_cycles_idx++;
   if(stat_adchs.freq_dma_irq_cycles_idx == FREQ_DMA_IRQ_CYCLES_MAX)
     stat_adchs.freq_dma_irq_cycles_idx = 0;
-
-  status = LPC_ADCHS->STATUS0;
-  LPC_ADCHS->CLR_STAT0 = status;
-
-  // ADCHS Error stat0
-
-  /* FIFO was full; conversion sample is not stored and lost */
-  if(status & STAT0_FIFO_OVERFLOW) 
-    stat_adchs.adchs_fifo_ovf++;
-
-  /* The ADC was not fully woken up when a sample was
-     converted and the conversion results is unreliable */
-  if(status & STAT0_DSCR_ERROR)
-    stat_adchs.adchs_dscr_error++;
-
-  /* Converted sample value was over range of the 12 bit output code. */
-  if(status & STAT0_ADC_OVF)
-    stat_adchs.adchs_adc_ovf++;
-
-  /* Converted sample value was under range of the 12 bit output code. */
-  if(status & STAT0_ADC_UNF)
-    stat_adchs.adchs_adc_unf++;
-
-  // DMA Error
-  status = LPC_GPDMA->INTERRSTAT;
-  if( status )
-  {
-    stat_adchs.dma_err_cnt++; // Count DMA Error
-    LPC_GPDMA->INTERRCLR |= status;
-  } 
 #endif
 
   adc_status = LPC_ADCHS->STATUS0;
@@ -542,20 +546,58 @@ void dma_isr(void)
   /* The timestamp mode reports every status bit once per chunk */
   LPC_ADCHS->CLR_STAT0 = (use_packing == LPC4370SDR_PACKING_TIMESTAMP_ON) ? adc_status : (adc_status & STAT0_FIFO_OVERFLOW);
 
-  status = LPC_GPDMA->INTERRSTAT;
-  if(status)
+  errors = LPC_GPDMA->INTERRSTAT;
+  if(errors)
   {
-    LPC_GPDMA->INTERRCLR = status;
+    LPC_GPDMA->INTERRCLR = errors;
     stream->dma_errors++;
   }
 
+#ifdef DMA_ISR_DEBUG
+  /* From the status read above, which the debug statistics clear in full */
+  LPC_ADCHS->CLR_STAT0 = adc_status;
+
+  // ADCHS Error stat0
+
+  /* FIFO was full; conversion sample is not stored and lost */
+  if(adc_status & STAT0_FIFO_OVERFLOW) 
+    stat_adchs.adchs_fifo_ovf++;
+
+  /* The ADC was not fully woken up when a sample was
+     converted and the conversion results is unreliable */
+  if(adc_status & STAT0_DSCR_ERROR)
+    stat_adchs.adchs_dscr_error++;
+
+  /* Converted sample value was over range of the 12 bit output code. */
+  if(adc_status & STAT0_ADC_OVF)
+    stat_adchs.adchs_adc_ovf++;
+
+  /* Converted sample value was under range of the 12 bit output code. */
+  if(adc_status & STAT0_ADC_UNF)
+    stat_adchs.adchs_adc_unf++;
+
+  // DMA Error
+  if(errors)
+    stat_adchs.dma_err_cnt++; // Count DMA Error
+#endif
+
+  done = 0;
   status = LPC_GPDMA->INTTCSTAT;
   if( status & INTTC0 )
   {
-    LPC_GPDMA->INTTCCLEAR |= INTTC0; /* Clear Chan0 */
-
-    dma_chunk_done(adc_status);
+    LPC_GPDMA->INTTCCLEAR = INTTC0; /* Clear Chan0 */
+    done = 1;
   }
+
+  /* A bus error disables the channel: it resumes with the next chunk, and the one it was filling,
+     counted as unsignalled, goes out damaged (stream->dma_errors tells) */
+  if(errors & INTERR0)
+    ADCHS_DMA_restart(stream->chunk_slots);
+
+  missed = dma_chunks_unsignalled(done);
+  stream->dma_resyncs += missed;
+  for(done += missed; done; done--)
+    dma_chunk_done(adc_status, (done > 1) ? DMA_CLEAR_NO : missed ? DMA_CLEAR_IF_DUE : DMA_CLEAR);
 
 #ifdef DMA_ISR_DEBUG
   stat_adchs.dma_irq_cycles[stat_adchs.dma_irq_cycles_idx] = (SCS_DWT_CYCCNT - tmp_cycles);
@@ -582,34 +624,48 @@ static void m0_commands(void)
   uint8_t framing_cmd;
   uint8_t framing_state;
 
+  /* The settings change only while no stream runs (the M0 stops it first): one sent during a stream
+     is acknowledged, or the M0 would wait forever, but not applied, and counted */
   samplerate_cmd = get_samplerate(&adchs_conf);
   if(samplerate_cmd == SET_SAMPLERATE_CMD)
   {
-    if((adchs_conf & LPC4370SDR_SAMPLERATE_CONF_ALT) == LPC4370SDR_SAMPLERATE_CONF_ALT)
+    if(adchs_started)
     {
-      adchs_conf = adchs_conf & (~LPC4370SDR_SAMPLERATE_CONF_ALT);
-      sys_clock_samplerate(&lpc4370sdr_conf->m0_m4_alt_conf[adchs_conf].lpc4370sdr_m4_conf);
-      adchs_sample_rate_hz = lpc4370sdr_conf->m0_m4_alt_conf[adchs_conf].m0_conf.r82x_if_freq * 4;
+      stream->commands_refused++;
     }else
     {
-      sys_clock_samplerate(&lpc4370sdr_conf->m0_m4_conf[adchs_conf].lpc4370sdr_m4_conf);
-      adchs_sample_rate_hz = lpc4370sdr_conf->m0_m4_conf[adchs_conf].m0_conf.r82x_if_freq * 4;
+      if((adchs_conf & LPC4370SDR_SAMPLERATE_CONF_ALT) == LPC4370SDR_SAMPLERATE_CONF_ALT)
+      {
+        adchs_conf = adchs_conf & (~LPC4370SDR_SAMPLERATE_CONF_ALT);
+        sys_clock_samplerate(&lpc4370sdr_conf->m0_m4_alt_conf[adchs_conf].lpc4370sdr_m4_conf);
+        adchs_sample_rate_hz = lpc4370sdr_conf->m0_m4_alt_conf[adchs_conf].m0_conf.r82x_if_freq * 4;
+      }else
+      {
+        sys_clock_samplerate(&lpc4370sdr_conf->m0_m4_conf[adchs_conf].lpc4370sdr_m4_conf);
+        adchs_sample_rate_hz = lpc4370sdr_conf->m0_m4_conf[adchs_conf].m0_conf.r82x_if_freq * 4;
+      }
+      ADCHS_set_sample_rate(adchs_sample_rate_hz);
     }
-    ADCHS_set_sample_rate(adchs_sample_rate_hz);
     ack_samplerate();
   }
   
   packing_cmd = get_packing(&packing_state);
   if(packing_cmd == SET_PACKING_CMD)
   {
-    set_packing_state(packing_state);
+    if(adchs_started)
+      stream->commands_refused++;
+    else
+      set_packing_state(packing_state);
     ack_packing();
   }
 
   framing_cmd = get_framing(&framing_state);
   if(framing_cmd == SET_FRAMING_CMD)
   {
-    set_framing_state(framing_state);
+    if(adchs_started)
+      stream->commands_refused++;
+    else
+      set_framing_state(framing_state);
     ack_framing();
   }
 
@@ -627,16 +683,14 @@ static void m0_commands(void)
       {
         adchs_start(DEFAULT_ADCHS_CHAN);
         adchs_started = 1;
-        adchs_stopped = 0;
       }
       ack_start_stop_adchs();
     break;
 
     case STOP_ADCHS_CMD:
-      if(adchs_stopped == 0)
+      if(adchs_started)
       {
         adchs_stop();
-        adchs_stopped = 1;
         adchs_started = 0;
       }
       ack_start_stop_adchs();
@@ -661,7 +715,8 @@ static int pack_chunk(void)
   uint32_t chunk;
   uint32_t* slot;
 
-  if(packing == LPC4370SDR_PACKING_OFF || (int32_t)behind <= 0)
+  /* After a stop the ring is left as it is: the next stream starts from scratch */
+  if(!adchs_started || packing == LPC4370SDR_PACKING_OFF || (int32_t)behind <= 0)
     return 0;
 
   /* Chunks further behind the DMA than the M0 queues get skipped (the M0 counts them as lost):
@@ -758,6 +813,7 @@ int main(void)
 
   stream_reset();
   stream->start_count = 0; /* RAM is not cleared at boot */
+  stream->commands_refused = 0;
 
   nvic_enable_irq(NVIC_DMA_IRQ);
   nvic_enable_irq(NVIC_M0CORE_IRQ);
@@ -768,7 +824,6 @@ int main(void)
   LPC4370SDR_DEBUG_MAILBOX->pending = 0; /* RAM is not cleared at boot */
 
   adchs_stop();
-  adchs_stopped = 1;
   adchs_started = 0;
   
   set_packing_state(0);
@@ -797,6 +852,7 @@ int main(void)
   {
     m0_commands();
 
+#ifndef LPC4370SDR_NO_DEBUG_REQUESTS
     if(LPC4370SDR_DEBUG_MAILBOX->pending)
     {
       typedef uint32_t (*dbg_call_fn_t)(uint32_t, uint32_t, uint32_t, uint32_t);
@@ -804,6 +860,7 @@ int main(void)
       LPC4370SDR_DEBUG_MAILBOX->result = fn(LPC4370SDR_DEBUG_MAILBOX->args[0], LPC4370SDR_DEBUG_MAILBOX->args[1], LPC4370SDR_DEBUG_MAILBOX->args[2], LPC4370SDR_DEBUG_MAILBOX->args[3]);
       LPC4370SDR_DEBUG_MAILBOX->pending = 0;
     }
+#endif
 
     if(!pack_chunk())
       signal_wfe();

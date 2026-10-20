@@ -164,7 +164,7 @@ void watchdog_init(void)
 
   WWDT_WARNINT = WATCHDOG_WARNING_COUNTS;
   WWDT_MOD = (WWDT_MOD & ~WWDT_MOD_WDTOF) | WWDT_MOD_WDINT; /* clear WDTOF and any stale warning */
-  nvic_set_priority(NVIC_RITIMER_OR_WWDT_IRQ, 0);
+  nvic_set_priority(NVIC_RITIMER_OR_WWDT_IRQ, 0); /* the highest: it must preempt a long USB request */
   nvic_enable_irq(NVIC_RITIMER_OR_WWDT_IRQ);
 }
 

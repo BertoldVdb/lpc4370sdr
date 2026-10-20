@@ -185,7 +185,8 @@ typedef struct
 	int16_t pps_uart_rel;    /* the edge among the auxiliary UART's bytes: the bytes received before it end this
 	                            many bytes after the last of this chunk's uart_data (negative: before it) */
 	uint16_t pps_uart_quiet_us; /* microseconds from the last UART byte received before the edge to the edge, a
-	                               lower bound, at most 65535; 0 when a byte arrived at the edge */
+	                               lower bound, at most 65535 (also when no byte was received since boot); 0 when a
+	                               byte arrived at the edge */
 	/* USB Start-Of-Frame tagging (LPC4370SDR_SET_SOF_DIVIDER), independent of the PPS input */
 	uint32_t sof_sample_index_lo; /* sample index of the last tagged SOF (low word) */
 	uint16_t sof_fraction;   /* position of that SOF within the sample, in 1/2^16 sample units */

@@ -171,9 +171,8 @@ void usb_endpoint_disable(const usb_endpoint_t* const endpoint)
   } else {
     USB0_ENDPTCTRL(endpoint_number) &= ~(USB0_ENDPTCTRL_RXE);
   }
-  usb_queue_flush_endpoint(endpoint);
-  usb_endpoint_clear_pending_interrupts(endpoint);
   usb_endpoint_flush(endpoint);
+  usb_endpoint_clear_pending_interrupts(endpoint);
 }
 
 void usb_endpoint_prime(
@@ -252,12 +251,13 @@ void usb_endpoint_schedule_append(
 void usb_endpoint_flush(const usb_endpoint_t* const endpoint)
 {
   const uint_fast8_t endpoint_number = usb_endpoint_number(endpoint->address);
-  usb_queue_flush_endpoint(endpoint);
+  /* The controller lets go of the transfers first: only then are they free for new ones */
   if( usb_endpoint_is_in(endpoint->address) ) {
     usb_flush_primed_endpoints(USB0_ENDPTFLUSH_FETB(1 << endpoint_number));
   } else {
     usb_flush_primed_endpoints(USB0_ENDPTFLUSH_FERB(1 << endpoint_number));
   }
+  usb_queue_flush_endpoint(endpoint);
 }
 /*
 static bool usb_endpoint_is_flushing(

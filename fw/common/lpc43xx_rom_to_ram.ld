@@ -85,6 +85,8 @@ SECTIONS
 	_etext = .;
 	_etext_ram = (. - ORIGIN(rom)) + ORIGIN(ram_local1);
 	_etext_rom = (. - ORIGIN(rom)) + ORIGIN(rom_flash);
+	/* The reset handler copies the code there: the ADC ring follows ram_local1 */
+	ASSERT(_etext_ram <= ORIGIN(ram_local1) + LENGTH(ram_local1), "the code copied to ram_local1 does not fit")
 
 	. = ORIGIN(ram_local2);
 

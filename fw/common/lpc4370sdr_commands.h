@@ -37,12 +37,14 @@ typedef enum
 } receiver_mode_t;
 
 // Commands (usb vendor request) shared between Firmware and Host.
+/* The last command of the 0.. range this firmware implements (SET_RF_PORT); the Airspy's ends at
+   27 (SPIFLASH_ERASE_SECTOR), the HydraSDR's numbers are the same up to 28 */
 #define LPC4370SDR_CMD_MAX (28)
 #define LPC4370SDR_EXT_CMD_BASE (0x80)
 #define LPC4370SDR_EXT_CMD_MAX (0x8A)
 typedef enum
 {
-	LPC4370SDR_RESET                      = 0 ,
+	LPC4370SDR_RESET                      = 0 , /* reboots the chip at once, no status stage (Airspy hosts call it INVALID) */
 	LPC4370SDR_RECEIVER_MODE              = 1 ,
 	LPC4370SDR_SI5351C_WRITE              = 2 ,
 	LPC4370SDR_SI5351C_READ               = 3 ,
@@ -73,7 +75,8 @@ typedef enum
 	LPC4370SDR_SET_RF_PORT                = LPC4370SDR_CMD_MAX,
 	/* 29..33 are taken by hydrasdr-host v1.1 (GET_CAPABILITIES, SET_BANDWIDTH, GET_BANDWIDTHS,
 	   GET_TEMPERATURE, SET_GAIN) and not implemented here: they stall, the host then falls back */
-	/* Stream metadata, timing and debug commands, kept clear of the upstream range */
+	/* Stream metadata, timing and debug commands, kept clear of the upstream range (HydraSDR and
+	   Airspy use 0..33 and nothing from 0x80 on) */
 	LPC4370SDR_GET_STREAM_STATUS          = LPC4370SDR_EXT_CMD_BASE + 0,
 	LPC4370SDR_SET_FRAMING                = LPC4370SDR_EXT_CMD_BASE + 1,
 	LPC4370SDR_WATCHDOG                   = LPC4370SDR_EXT_CMD_BASE + 2,
@@ -81,14 +84,14 @@ typedef enum
 	LPC4370SDR_UART_WRITE                 = LPC4370SDR_EXT_CMD_BASE + 4, /* OUT data = bytes to transmit (max 64) */
 	LPC4370SDR_SET_CALIBRATION            = LPC4370SDR_EXT_CMD_BASE + 5, /* wValue|wIndex<<16 = crystal correction in ppb (int32), applied at once */
 	LPC4370SDR_GET_CALIBRATION            = LPC4370SDR_EXT_CMD_BASE + 6, /* IN: lpc4370sdr_calibration_t */
-	/* Debug access, see lpc4370sdr_debug: */
+	/* Debug access, see lpc4370sdr_debug. A build with LPC4370SDR_NO_DEBUG_REQUESTS (make
+	   DEBUG_REQUESTS=0) leaves MEM_WRITE and CALL out: they stall, MEM_READ stays */
 	LPC4370SDR_MEM_READ                   = LPC4370SDR_EXT_CMD_BASE + 7, /* IN: wValue | wIndex << 16 = address, wLength <= 64 bytes */
 	LPC4370SDR_MEM_WRITE                  = LPC4370SDR_EXT_CMD_BASE + 8, /* OUT: same addressing, data = bytes to write */
 	LPC4370SDR_CALL                       = LPC4370SDR_EXT_CMD_BASE + 9, /* OUT: lpc4370sdr_call_request_t runs a function; IN: lpc4370sdr_call_result_t */
-	LPC4370SDR_SET_SOF_DIVIDER            = LPC4370SDR_EXT_CMD_MAX /* wValue | wIndex << 16 = divider: tag the first SOF of every USB frame whose number is a multiple of it, 0 = off; cleared at every stream stop */
+	LPC4370SDR_SET_SOF_DIVIDER            = LPC4370SDR_EXT_CMD_MAX /* wValue | wIndex << 16 = divider: tag the first SOF of every USB frame whose number is a multiple of it, 0 = off; kept by the restart a setting change performs, cleared when the receiver goes off */
 } lpc4370sdr_vendor_request;
 
-/* Reply to LPC4370SDR_GET_STREAM_STATUS: 8 little-endian uint32 */
 /* Crystal correction in effect: the flash block's value */
 #define LPC4370SDR_CALIBRATION_SOURCE_NONE  (0)
 #define LPC4370SDR_CALIBRATION_SOURCE_FLASH (1)
@@ -113,6 +116,7 @@ typedef struct
 	uint32_t source; /* LPC4370SDR_CALIBRATION_SOURCE_* */
 } lpc4370sdr_calibration_t;
 
+/* Reply to LPC4370SDR_GET_STREAM_STATUS: 16 little-endian uint32 */
 typedef struct
 {
 	uint32_t captured;      /* chunks captured by the ADC DMA */
@@ -151,8 +155,10 @@ typedef struct
  * The chunk header, version 2. Fields that only grow are sent modulo 2^16 (a host extends them from
  * one header to the next: they never move 2^15 between two chunks); the chunk's 64-bit sample index
  * is chunk_index (extended past its 32-bit wrap by the host) times sample_count. The PPS edge's and
- * the SOF's sample indices are sent as their low words: the edge is never 2^31 samples from the
- * chunk that reports it. ext[] carries items a host need not know to stay in step - see
+ * the SOF's 64-bit sample indices are sent as their low words, which a host extends from the
+ * chunk's sample index: only while the edge is less than 2^31 samples behind the chunk. The last
+ * edge stays in the headers when the input stops, so a host takes an edge only when pps_count
+ * (sof_count) changed. ext[] carries items a host need not know to stay in step - see
  * LPC4370SDR_EXT_*. check makes a header hard to mistake for sample data when a host looks for the
  * chunk boundaries again.
  */
@@ -162,7 +168,7 @@ typedef struct
 typedef struct
 {
 	uint32_t magic;          /* LPC4370SDR_FRAME_MAGIC */
-	uint32_t chunk_index;    /* chunk number since stream start (wraps; the device's counter is 64-bit) */
+	uint32_t chunk_index;    /* chunk number since stream start (the device's counter is 32-bit too: it wraps) */
 	uint8_t version;         /* LPC4370SDR_FRAME_VERSION */
 	uint8_t flags;           /* LPC4370SDR_FRAME_FLAG_* */
 	uint8_t stream_start_count; /* streams started since power-on (mod 256): it changes when a setting change
@@ -180,7 +186,8 @@ typedef struct
 	int16_t pps_uart_rel;    /* the edge among the auxiliary UART's bytes: the bytes received before it end this
 	                            many bytes after the last of this chunk's uart_data (negative: before it) */
 	uint16_t pps_uart_quiet_us; /* microseconds from the last UART byte received before the edge to the edge, a
-	                               lower bound, at most 65535; 0 when a byte arrived at the edge */
+	                               lower bound, at most 65535 (also when no byte was received since boot); 0 when a
+	                               byte arrived at the edge */
 	/* USB Start-Of-Frame tagging (LPC4370SDR_SET_SOF_DIVIDER), independent of the PPS input */
 	uint32_t sof_sample_index_lo; /* sample index of the last tagged SOF (low word) */
 	uint16_t sof_fraction;   /* position of that SOF within the sample, in 1/2^16 sample units */

@@ -63,7 +63,7 @@ lpc4370sdr_mini_conf_t __attribute__ ((section(".nocopy_data"))) lpc4370sdr_mini
 				/* Also i2c0_pll1_ls_hs_conf_val => I2C val (For 400KHz) = (5*FreqPLL1MHz)/4 */
 				150, /* uint16_t i2c0_pll1_ls_hs_conf_val; Si5351C */
 				150, /* uint16_t i2c1_pll1_hs_conf_val; R82X */
-				/* Configure I2C1 to 400kHz (48MHz/(2*90)=0.266MHz) */
+				/* Configure I2C1 to 400kHz (72MHz/(2*90)=0.4MHz) */
 				90, /* uint16_t i2c1_pll1_ls_conf_val; R82X */
 				0, /* padding */
 				0 /* spare */
@@ -79,18 +79,18 @@ lpc4370sdr_mini_conf_t __attribute__ ((section(".nocopy_data"))) lpc4370sdr_mini
 			(0 << 28) | (12 << 22) | (6 << 17) | (255 << 0), // uint32_t pll0_usb_mdiv; SELR SELI SELP MDEC
 			(0 << 0) | (0 << 12), // uint32_t pll0_usb_npdiv; PDEC NDEC
 			(PLL0USB_CTRL_FLAG_DIRECT_I | PLL0USB_CTRL_FLAG_DIRECT_O), // uint32_t pll0usb_ctrl_flags; DirectI=PLL0USB_CTRL_FLAG_DIRECT_I or/and DirectO=PLL0USB_CTRL_FLAG_DIRECT_O */
-			/* PLL1 clock from GP_CLKIN */
-			/* PLL1 High Speed Mode Set PLL1 to 24MHz * (4+1) = 120MHz */
+			/* PLL1 clock from GP_CLKIN, FCCO = 24MHz * (MSEL+1) / (NSEL+1) (156 to 320MHz), divided by 2 << PSEL */
+			/* PLL1 High Speed Mode Set PLL1 to 24MHz * (9+1) / 2 = 120MHz (FCCO 240MHz) */
 			{
 				0, // uint32_t pll1_hs_psel;
 				0, // uint32_t pll1_hs_nsel;
-				4, // uint32_t pll1_hs_msel;
+				9, // uint32_t pll1_hs_msel;
 			},
-			/* PLL1 Low Speed Mode => Set PLL1 to 24MHz * (1+1) = 48MHz */
+			/* PLL1 Low Speed Mode => Set PLL1 to 24MHz * (11+1) / 4 = 72MHz (FCCO 288MHz) */
 			{
-				0, // uint32_t pll1_ls_psel;
+				1, // uint32_t pll1_ls_psel;
 				0, // uint32_t pll1_ls_nsel;
-				2, // uint32_t pll1_ls_msel;
+				11, // uint32_t pll1_ls_msel;
 			}
 		}, /* End core_clocks_t m4_init_conf */
 
@@ -152,9 +152,10 @@ lpc4370sdr_mini_conf_t __attribute__ ((section(".nocopy_data"))) lpc4370sdr_mini
 
 	/* 1st Expansion Conf Point M0/M4 Data */
 	/*
-	SampleRate configuration with GP_CLKIN=20MHz
+	SampleRate configuration with GP_CLKIN=24MHz
 	Configuration of PLL0AUDIO shall not exceed 80MHz for ADCHS
 	For PLL0AUDIO sys_clock_samplerate() set SEL_EXT to 1 => MDEC enabled. Fractional divider not used.
+	PLL0AUDIO_MDIV has no SELP/SELI/SELR fields: its encoder sets the bandwidth (UM10503 Table 130).
 	For PLL0AUDIO see UM10503 Rev1.8 "Fig 34. PLL0 with fractional divider" Page 184 / 1420 for more details.
 	Configuration of IDIVB => Integer divider B divider values (1/(IDIV + 1))
   */
@@ -254,9 +255,10 @@ lpc4370sdr_mini_conf_t __attribute__ ((section(".nocopy_data"))) lpc4370sdr_mini
 
 	/* 2nd Expansion Conf Point M0/M4 ALT Data */
 	/*
-	SampleRate configuration with GP_CLKIN=20MHz
+	SampleRate configuration with GP_CLKIN=24MHz
 	Configuration of PLL0AUDIO shall not exceed 80MHz for ADCHS
 	For PLL0AUDIO sys_clock_samplerate() set SEL_EXT to 1 => MDEC enabled. Fractional divider not used.
+	PLL0AUDIO_MDIV has no SELP/SELI/SELR fields: its encoder sets the bandwidth (UM10503 Table 130).
 	For PLL0AUDIO see UM10503 Rev1.8 "Fig 34. PLL0 with fractional divider" Page 184 / 1420 for more details.
 	Configuration of IDIVB => Integer divider B divider values (1/(IDIV + 1))
   */

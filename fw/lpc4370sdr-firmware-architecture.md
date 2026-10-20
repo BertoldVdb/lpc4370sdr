@@ -39,13 +39,9 @@ lpc4370sdr firmware directory structure and software architecture
     (W25Q80BV/S25FL032P), watchdog
 
 * `fw_bin` links the m0, m0s and m4 images into `lpc4370sdr_fw.bin` (SPI flash)
-  and `lpc4370sdr_dfu.dfu` (RAM). `dfuprog_hydrasdr` and `usbprog_hydrasdr`
-  hold the Windows flashing tools from the HydraSDR project.
+  and `lpc4370sdr_dfu.dfu` (RAM).
 
 * `libopencm3` contains the peripheral library for the M0, M0s and M4 cores.
-
-* `scripts` contains a Python script that writes the version header from git
-  (not used by the build: `m0/m0.hdr` sets the version).
 
 The M0 core is the main manager: it answers USB, so the M4F core stays free for
 the signal path.

@@ -1,2 +1,2 @@
-This directory contains things shared by multiple HydraSDR firmware
-implementations.
+This directory contains the code and linker scripts shared by the lpc4370sdr
+firmware's cores (M4, M0 and M0s), see ../lpc4370sdr-firmware-architecture.md.

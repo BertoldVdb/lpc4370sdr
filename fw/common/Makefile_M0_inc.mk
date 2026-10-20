@@ -51,6 +51,10 @@ LDFLAGS += -mcpu=cortex-m0 -mthumb -DTHUMB \
 
 OBJ += $(SRC:.c=.o)
 
+# The build options, the same for every core: fw_bin checks that the M4's match these
+NOFLASH ?= 0
+WATCHDOG ?= 0
+DEBUG_REQUESTS ?= 1
 ifeq ($(WATCHDOG),1)
 CFLAGS += -DLPC4370SDR_HOST_WATCHDOG=1
 endif
@@ -58,9 +62,13 @@ endif
 ifeq ($(NOFLASH),1)
 CFLAGS += -DLPC4370SDR_NO_FLASH=1
 endif
+# make DEBUG_REQUESTS=0: no MEM_WRITE and CALL requests
+ifeq ($(DEBUG_REQUESTS),0)
+CFLAGS += -DLPC4370SDR_NO_DEBUG_REQUESTS
+endif
 # The build options in effect: .opts changes (and every object rebuilds) when they do. A file
 # that always exists, since .SECONDARY would let a missing stamp go unnoticed.
-BUILD_OPTS := w$(WATCHDOG)_f$(NOFLASH)_x$(EXTRA_CFLAGS)
+BUILD_OPTS := w$(WATCHDOG)_f$(NOFLASH)_d$(DEBUG_REQUESTS)_x$(EXTRA_CFLAGS)
 # make EXTRA_CFLAGS=...: test builds, e.g. -DLPC4370SDR_STREAM_COUNTER_START=0xFFFFF000u
 CFLAGS += $(EXTRA_CFLAGS)
 OPTS_STAMP = .opts
@@ -86,19 +94,8 @@ all: images
 images: $(BINARY).images
 flash: $(BINARY).flash
 
-program: $(BINARY).dfu
-	$(Q)dfu-util --device 1fc9:000c --alt 0 --download $(BINARY).dfu
-
 %.images: %.hdr %.bin %.hex %.srec %.list
 	@#echo "*** $* images generated ***"
-
-%.dfu: %.bin
-	$(Q)rm -f _tmp.dfu _header.bin
-	$(Q)cp $(*).bin _tmp.dfu
-	$(Q)dfu-suffix --vid=0x1fc9 --pid=0x000c --did=0x0 -s 0 -a _tmp.dfu
-	$(Q)python -c "import os.path; import struct; print('0000000: da ff ' + ' '.join(map(lambda s: '%02x' % ord(s), struct.pack('<H', os.path.getsize('$(*).bin') / 512 + 1))) + ' ff ff ff ff')" | xxd -g1 -r > _header.bin
-	$(Q)cat _header.bin _tmp.dfu >$(*).dfu
-	$(Q)rm -f _tmp.dfu _header.bin
 
 %.bin: %.elf
 	@#printf "  OBJCOPY $(*).bin\n"
@@ -152,8 +149,6 @@ FORCE:
 
 # Anything that depends on FORCE will be considered out-of-date
 %.hdr: FORCE
-#	echo Creating $@
-#	python ../scripts/lpc4370sdr_fw-version.py ./$@
 
 -include $(OBJ:.o=.d)
 

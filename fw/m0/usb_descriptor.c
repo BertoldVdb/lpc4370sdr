@@ -39,7 +39,6 @@
 #define USB_MAX_PACKET_BULK_HS (512)
 
 #define USB_BULK_IN_EP_ADDR  (0x81)
-#define USB_BULK_OUT_EP_ADDR (0x02)
 
 #define USB_STRING_LANGID (0x0409)
 
@@ -78,7 +77,7 @@ uint8_t usb_descriptor_configuration_full_speed[] =
 {
   9,                      // bLength
   USB_DESCRIPTOR_TYPE_CONFIGURATION,  // bDescriptorType
-  USB_WORD(32),           // wTotalLength
+  USB_WORD(25),           // wTotalLength
   0x01,                   // bNumInterfaces
   0x01,                   // bConfigurationValue
   0x00,                   // iConfiguration
@@ -89,7 +88,7 @@ uint8_t usb_descriptor_configuration_full_speed[] =
   USB_DESCRIPTOR_TYPE_INTERFACE,    // bDescriptorType
   0x00,                   // bInterfaceNumber
   0x00,                   // bAlternateSetting
-  0x02,                   // bNumEndpoints
+  0x01,                   // bNumEndpoints: bulk IN
   0xFF,                   // bInterfaceClass: vendor-specific
   0xFF,                   // bInterfaceSubClass
   0xFF,                   // bInterfaceProtocol: vendor-specific
@@ -101,13 +100,6 @@ uint8_t usb_descriptor_configuration_full_speed[] =
   0x02,                   // bmAttributes: BULK
   USB_WORD(USB_MAX_PACKET_BULK_FS),   // wMaxPacketSize
   0x00,                   // bInterval: no NAK
-  
-  7,                      // bLength
-  USB_DESCRIPTOR_TYPE_ENDPOINT,   // bDescriptorType
-  USB_BULK_OUT_EP_ADDR,   // bEndpointAddress
-  0x02,                   // bmAttributes: BULK
-  USB_WORD(USB_MAX_PACKET_BULK_FS),   // wMaxPacketSize
-  0x00,                   // bInterval: no NAK
 
   0,                  // TERMINATOR
 };
@@ -116,7 +108,7 @@ uint8_t usb_descriptor_configuration_high_speed[] =
 {
   9,                      // bLength
   USB_DESCRIPTOR_TYPE_CONFIGURATION,  // bDescriptorType
-  USB_WORD(32),           // wTotalLength
+  USB_WORD(25),           // wTotalLength
   0x01,                   // bNumInterfaces
   0x01,                   // bConfigurationValue
   0x00,                   // iConfiguration
@@ -127,7 +119,7 @@ uint8_t usb_descriptor_configuration_high_speed[] =
   USB_DESCRIPTOR_TYPE_INTERFACE,    // bDescriptorType
   0x00,                   // bInterfaceNumber
   0x00,                   // bAlternateSetting
-  0x02,                   // bNumEndpoints
+  0x01,                   // bNumEndpoints: bulk IN
   0xFF,                   // bInterfaceClass: vendor-specific
   0xFF,                   // bInterfaceSubClass
   0xFF,                   // bInterfaceProtocol: vendor-specific
@@ -136,13 +128,6 @@ uint8_t usb_descriptor_configuration_high_speed[] =
   7,                      // bLength
   USB_DESCRIPTOR_TYPE_ENDPOINT,   // bDescriptorType
   USB_BULK_IN_EP_ADDR,            // bEndpointAddress
-  0x02,                   // bmAttributes: BULK
-  USB_WORD(USB_MAX_PACKET_BULK_HS),   // wMaxPacketSize
-  0x00,                   // bInterval: no NAK
-  
-  7,                      // bLength
-  USB_DESCRIPTOR_TYPE_ENDPOINT,   // bDescriptorType
-  USB_BULK_OUT_EP_ADDR,           // bEndpointAddress
   0x02,                   // bmAttributes: BULK
   USB_WORD(USB_MAX_PACKET_BULK_HS),   // wMaxPacketSize
   0x00,                   // bInterval: no NAK
@@ -353,7 +338,7 @@ uint8_t usb_descriptor_CompatIDDescriptor[] =
   0x04,0x00,   //wIndex (Fixed:INDEX_CONFIG_DESCRIPTOR)
   0x01,        //bCount (Count of device functions - Must be 1)
   0x00,0x00,0x00,0x00,0x00,0x00,0x00, //Reserved
-  0x01,        //bFirstInterfaceNumber (First interface for this function)
+  0x00,        //bFirstInterfaceNumber (First interface for this function)
   0x01,        //Reserved
   'W' ,'I' ,'N' ,'U' ,'S' ,'B' ,0x00,0x00, //Compatible ID, padded with zeros
   'W' ,'I' ,'N' ,'U' ,'S' ,'B' ,0x00,0x00, //Sub-compatible ID, padded with zeros

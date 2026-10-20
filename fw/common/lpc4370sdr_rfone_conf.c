@@ -78,18 +78,18 @@ lpc4370sdr_rfone_conf_t __attribute__ ((section(".nocopy_data"))) lpc4370sdr_rfo
 			0x040E03FF, // uint32_t pll0_usb_mdiv; SELR SELI SELP MDEC
 			0x00000000, // uint32_t pll0_usb_npdiv; PDEC NDEC
 			(PLL0USB_CTRL_FLAG_DIRECT_I | PLL0USB_CTRL_FLAG_DIRECT_O), // uint32_t pll0usb_ctrl_flags; DirectI=PLL0USB_CTRL_FLAG_DIRECT_I or/and DirectO=PLL0USB_CTRL_FLAG_DIRECT_O */
-			/* PLL1 clock from GP_CLKIN */
-			/* PLL1 High Speed Mode Set PLL1 to 20MHz * (6+1) = 140MHz */
+			/* PLL1 clock from GP_CLKIN, FCCO = 20MHz * (MSEL+1) / (NSEL+1) (156 to 320MHz), divided by 2 << PSEL */
+			/* PLL1 High Speed Mode Set PLL1 to 20MHz * (13+1) / 2 = 140MHz (FCCO 280MHz) */
 			{
 				0, // uint32_t pll1_hs_psel;
 				0, // uint32_t pll1_hs_nsel;
-				6, // uint32_t pll1_hs_msel;
+				13, // uint32_t pll1_hs_msel;
 			},
-			/* PLL1 Low Speed Mode => Set PLL1 to 20MHz * (1+1) = 40MHz */
+			/* PLL1 Low Speed Mode => Set PLL1 to 20MHz * (7+1) / 4 = 40MHz (FCCO 160MHz) */
 			{
-				0, // uint32_t pll1_ls_psel;
+				1, // uint32_t pll1_ls_psel;
 				0, // uint32_t pll1_ls_nsel;
-				1, // uint32_t pll1_ls_msel;
+				7, // uint32_t pll1_ls_msel;
 			}
 		}, /* End core_clocks_t m4_init_conf */
 
@@ -154,6 +154,7 @@ lpc4370sdr_rfone_conf_t __attribute__ ((section(".nocopy_data"))) lpc4370sdr_rfo
 	SampleRate configuration with GP_CLKIN=20MHz from SI5351C CLK7 LPC4370 GP_CLKIN
 	Configuration of PLL0AUDIO shall not exceed 80MHz for ADCHS
 	For PLL0AUDIO sys_clock_samplerate() set SEL_EXT to 1 => MDEC enabled. Fractional divider not used.
+	PLL0AUDIO_MDIV has no SELP/SELI/SELR fields: its encoder sets the bandwidth (UM10503 Table 130).
 	For PLL0AUDIO see UM10503 Rev1.8 "Fig 34. PLL0 with fractional divider" Page 184 / 1420 for more details.
 	Configuration of IDIVB => Integer divider B divider values (1/(IDIV + 1))
 	*/
@@ -253,6 +254,7 @@ lpc4370sdr_rfone_conf_t __attribute__ ((section(".nocopy_data"))) lpc4370sdr_rfo
 	SampleRate configuration with GP_CLKIN=20MHz from SI5351C CLK7 LPC4370 GP_CLKIN
 	Configuration of PLL0AUDIO shall not exceed 80MHz for ADCHS
 	For PLL0AUDIO sys_clock_samplerate() set SEL_EXT to 1 => MDEC enabled. Fractional divider not used.
+	PLL0AUDIO_MDIV has no SELP/SELI/SELR fields: its encoder sets the bandwidth (UM10503 Table 130).
 	For PLL0AUDIO see UM10503 Rev1.8 "Fig 34. PLL0 with fractional divider" Page 184 / 1420 for more details.
 	Configuration of IDIVB => Integer divider B divider values (1/(IDIV + 1))
 	*/
@@ -296,7 +298,7 @@ lpc4370sdr_rfone_conf_t __attribute__ ((section(".nocopy_data"))) lpc4370sdr_rfo
 			},
 			/* m0_conf_t m0_conf */
 			{
-				4000000, // Freq 20MHz => 8MHz IQ => IF Freq = 4MHz (r82x_if_freq)
+				4000000, // Freq 16MHz => 8MHz IQ => IF Freq = 4MHz (r82x_if_freq)
 				57, // uint8_t r82x_bw;
 				0,// uint8_t padding0;
 				0 // uint16_t padding1;

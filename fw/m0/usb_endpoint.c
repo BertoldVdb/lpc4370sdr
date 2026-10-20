@@ -59,13 +59,3 @@ const volatile usb_transfer_descriptor_t* usb_endpoint_bulk_in_td(const uint32_t
 {
   return &usb_endpoint_bulk_in_transfers[index].td;
 }
-
-usb_endpoint_t usb_endpoint_bulk_out = {
-  .address = 0x02,
-  .device = &usb_device,
-  .in = 0,
-  .out = &usb_endpoint_bulk_out,
-  .setup_complete = 0,
-  .transfer_complete = usb_queue_transfer_complete,
-};
-static USB_DEFINE_QUEUE(usb_endpoint_bulk_out, 1);
